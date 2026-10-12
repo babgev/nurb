@@ -885,14 +885,26 @@ function App() {
   };
 
   const closeTab = (id: string) => {
-    if (busyRef.current[id]) return;
-    const next = closeChatTab({ columns, selected: selectedTabs }, id);
+    if (busyRef.current[id]) {
+      setError("Stop the agent before closing this tab.");
+      return;
+    }
+    const next = closeChatTab({ columns, selected: selectedTabs }, id, crypto.randomUUID());
     if (next.columns === columns) return;
     const closing = columns.find((col) => col.id === id);
     if (closing) setClosedTabs((list) => [...list.filter((col) => col.id !== id), closing]);
     setColumns(next.columns);
     setSelectedTabs(next.selected);
   };
+
+  // The native accelerator also works while the CAD viewer iframe has focus.
+  // One native event path avoids closing two tabs from the same key press.
+  const closeActiveTab = useRef(() => {});
+  closeActiveTab.current = () => { if (visibleColumnId) closeTab(visibleColumnId); };
+  useEffect(() => {
+    const unlisten = listen("menu:close-tab", () => closeActiveTab.current());
+    return () => { unlisten.then((fn) => fn()); };
+  }, []);
 
   const reopenTab = (id: string) => {
     const tab = closedTabs.find((col) => col.id === id);

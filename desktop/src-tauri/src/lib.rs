@@ -469,8 +469,43 @@ fn test_hook(app: AppHandle) {
 /// sits under About where every Mac app keeps it; the webview owns the update
 /// state, so the click is forwarded there as an event.
 fn install_menu(app: &AppHandle) -> tauri::Result<()> {
-    use tauri::menu::{Menu, MenuItem, HELP_SUBMENU_ID};
+    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu, HELP_SUBMENU_ID, WINDOW_SUBMENU_ID};
     let menu = Menu::default(app)?;
+    let close_tab = MenuItem::with_id(
+        app,
+        "chat:close-tab",
+        "Close Tab",
+        true,
+        Some("CmdOrCtrl+W"),
+    )?;
+    let mut has_file_menu = false;
+    // Tauri installs Close Window in both File and Window. Remove both native
+    // actions so Cmd+W can never close the app while a conversation is focused.
+    for item in menu.items()? {
+        let Some(submenu) = item.as_submenu() else {
+            continue;
+        };
+        if submenu.id().as_ref() == WINDOW_SUBMENU_ID || submenu.text()? == "File" {
+            for child in submenu.items()? {
+                submenu.remove(&child)?;
+            }
+            if submenu.id().as_ref() == WINDOW_SUBMENU_ID {
+                submenu.append_items(&[
+                    &PredefinedMenuItem::minimize(app, None)?,
+                    &PredefinedMenuItem::maximize(app, None)?,
+                ])?;
+            } else {
+                has_file_menu = true;
+                submenu.append(&close_tab)?;
+                #[cfg(not(target_os = "macos"))]
+                submenu.append(&PredefinedMenuItem::quit(app, None)?)?;
+            }
+        }
+    }
+    // Linux and BSD omit File from the default menu.
+    if !has_file_menu {
+        menu.insert(&Submenu::with_items(app, "File", true, &[&close_tab])?, 0)?;
+    }
     if let Some(appmenu) = menu.items()?.first().and_then(|i| i.as_submenu().cloned()) {
         appmenu.insert(
             &MenuItem::with_id(app, "app:check-updates", "Check for Updates…", true, None::<&str>)?,
@@ -488,6 +523,10 @@ fn install_menu(app: &AppHandle) -> tauri::Result<()> {
         use tauri::Emitter;
         use tauri_plugin_opener::OpenerExt;
         let url = match event.id().as_ref() {
+            "chat:close-tab" => {
+                let _ = app.emit("menu:close-tab", ());
+                return;
+            }
             "app:check-updates" => {
                 let _ = app.emit("menu:check-updates", ());
                 return;

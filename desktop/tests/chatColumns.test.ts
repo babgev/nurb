@@ -59,10 +59,32 @@ test("switching project or part uses each scope's remembered tab", () => {
 test("closing selected tab selects a neighbor without altering its session or draft", () => {
   const nextTab = { ...fresh("second"), resume: "retained", draft: { text: "Retain", files: [] } };
   const key = chatKey(nextTab.path, nextTab.part);
-  const next = closeChatTab({ columns: [fresh(), nextTab], selected: { [key]: "first" } }, "first");
+  const next = closeChatTab({ columns: [fresh(), nextTab], selected: { [key]: "first" } }, "first", "replacement");
   assert.deepEqual(next.columns, [nextTab]);
   assert.equal(next.selected[key], "second");
-  assert.equal(closeChatTab(next, "second"), next);
+});
+
+test("closing the final tab leaves a fresh conversation with its model preferences", () => {
+  const closing = { ...fresh(), resume: "saved-session", draft: { text: "Keep in history", files: ["reference.png"] }, config: { model: "opus", thought_level: "high" }, model: "Opus 5.5", unseen: true };
+  const elsewhere = fresh("elsewhere", "/projects/beta");
+  const key = chatKey(closing.path, closing.part);
+  const state = { columns: [closing, elsewhere], selected: { [key]: closing.id } };
+  const next = closeChatTab(state, closing.id, "replacement");
+  assert.equal(next.selected[key], "replacement");
+  assert.deepEqual(next.columns[0], { id: "replacement", path: closing.path, part: closing.part, agent: closing.agent, resume: null, unseen: false, config: closing.config, model: closing.model });
+  assert.equal(next.columns[1], elsewhere);
+  assert.equal(closing.resume, "saved-session");
+  assert.equal(closing.draft.text, "Keep in history");
+  assert.equal(closeChatTab(state, "missing", "replacement"), state);
+});
+
+test("closing a background tab leaves the selected conversation alone", () => {
+  const first = fresh();
+  const second = fresh("second");
+  const key = chatKey(first.path, first.part);
+  const next = closeChatTab({ columns: [first, second], selected: { [key]: first.id } }, second.id, "unused");
+  assert.deepEqual(next.columns, [first]);
+  assert.equal(next.selected[key], first.id);
 });
 
 test("corrupt storage and stale or cross-project selections are ignored safely", () => {

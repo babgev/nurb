@@ -7,8 +7,8 @@
 .conversation-tab.selected > button:first-child { color: var(--text); }
 .conversation-tab-name { max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conversation-tab-number { color: var(--dimmer); font-size: 9px; }
-.conversation-tab .conversation-tab-close { padding: 5px; font-size: 15px; }
-.conversation-tab .conversation-tab-close:disabled { opacity: .3; cursor: default; }
+.conversation-tab .conversation-tab-close { flex: none; display: grid; place-items: center; width: 20px; height: 20px; margin: 3px 4px 3px 0; padding: 0; border-radius: 4px; font-size: 15px; line-height: 1; }
+.conversation-tab .conversation-tab-close:disabled { opacity: .3; cursor: default; pointer-events: none; }
 .conversation-tab-add { flex: none; align-self: flex-start; padding: 4px 7px; font-size: 20px; border-radius: 6px; }
 .conversation-tab-add:hover, .conversation-tab-close:hover:not(:disabled) { background: var(--hover); color: var(--text); }
 .conversation-tab-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--dimmer); opacity: .5; }

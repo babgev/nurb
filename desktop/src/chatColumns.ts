@@ -45,14 +45,20 @@ export function selectedChat(columns: ChatColumn[], selected: Record<string, str
   return group.find((col) => col.id === selected[chatKey(path, part)]) ?? group[0];
 }
 
-export function closeChatTab(state: SavedChatTabs, id: string): SavedChatTabs {
+export function closeChatTab(state: SavedChatTabs, id: string, replacementId: string): SavedChatTabs {
   const closing = state.columns.find((col) => col.id === id);
   if (!closing) return state;
   const siblings = state.columns.filter((col) => col.path === closing.path && col.part === closing.part);
-  if (siblings.length === 1) return state;
+  const key = chatKey(closing.path, closing.part);
+  if (siblings.length === 1) return {
+    columns: state.columns.map((col) => col.id === id ? {
+      id: replacementId, path: col.path, part: col.part, agent: col.agent,
+      resume: null, unseen: false, config: col.config, model: col.model,
+    } : col),
+    selected: { ...state.selected, [key]: replacementId },
+  };
   const index = siblings.findIndex((col) => col.id === id);
   const next = siblings[index + 1] ?? siblings[index - 1];
-  const key = chatKey(closing.path, closing.part);
   return {
     columns: state.columns.filter((col) => col.id !== id),
     selected: state.selected[key] === id ? { ...state.selected, [key]: next.id } : state.selected,
