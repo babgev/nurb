@@ -195,6 +195,9 @@ function Chat({
   // The model and effort this conversation runs on. Empty before the agent has
   // ever reported its lists, which is only ever the first chat on this Mac.
   const [config, setConfig] = useState<ConfigRow[]>([]);
+  const [configError, setConfigError] = useState<string | null>(null);
+  const [configuring, setConfiguring] = useState(false);
+  const configuringRef = useRef(false);
   const [picking, setPicking] = useState(false);
   const [switching, setSwitching] = useState(false);
   const sessionRef = useRef<string | null>(null);
@@ -399,7 +402,7 @@ function Chat({
   const refreshConfig = useCallback(() => {
     invoke<ConfigRow[]>("chat_config", { agent, sessionId: sessionRef.current })
       .then(setConfig)
-      .catch(() => {});
+      .catch((error) => setConfigError(`Could not load model choices: ${String(error)}`));
   }, [agent]);
 
   useEffect(refreshConfig, [refreshConfig]);
@@ -416,6 +419,10 @@ function Chat({
 
   const pick = useCallback(
     async (category: string, value: string) => {
+      if (configuringRef.current) return;
+      configuringRef.current = true;
+      setConfiguring(true);
+      setConfigError(null);
       // Optimistic: the round trip goes through the adapter, and a select that
       // lags behind the click reads as a dropped one.
       setConfig((rows) =>
@@ -430,8 +437,12 @@ function Chat({
             value,
           }),
         );
-      } catch {
+      } catch (error) {
+        setConfigError(`Could not change this setting: ${String(error)}`);
         refreshConfig();
+      } finally {
+        configuringRef.current = false;
+        setConfiguring(false);
       }
     },
     [agent, refreshConfig],
@@ -562,6 +573,7 @@ function Chat({
     if (
       (!text && !attachmentDraft.hasContent) ||
       sendingRef.current ||
+      configuringRef.current ||
       starting ||
       startRef.current
     )
@@ -927,16 +939,16 @@ function Chat({
           >
             <IconPaperclip />
           </button>
-          {config.length > 0 && (
+          {(config.length > 0 || configError) && (
             <div className="chat-config">
               <button
                 type="button"
                 className="chat-config-button"
                 aria-expanded={picking}
-                title={`${label} is set to ${summarize(config)}`}
+                title={config.length ? `${label} is set to ${summarize(config)}` : "Model settings"}
                 onClick={() => setPicking((open) => !open)}
               >
-                {summarize(config)}
+                {summarize(config) || "model settings"}
               </button>
               {picking && (
                 <>
@@ -949,7 +961,7 @@ function Chat({
                         <span>{row.name}</span>
                         <select
                           value={row.value}
-                          disabled={busy || starting}
+                          disabled={busy || starting || configuring}
                           onChange={(event) => pick(row.category, event.target.value)}
                         >
                           {row.options.map((option) => (
@@ -965,6 +977,7 @@ function Chat({
                         ? `Wait for ${label} to finish to change these.`
                         : "Bigger models and higher effort use up your plan faster."}
                     </p>
+                    {configError && <p className="chat-config-error" role="alert">{configError}</p>}
                   </div>
                 </>
               )}
@@ -975,7 +988,7 @@ function Chat({
               stop
             </button>
           ) : (
-            <button type="submit" className="chat-send" disabled={starting}>
+            <button type="submit" className="chat-send" disabled={starting || configuring}>
               send
             </button>
           )}

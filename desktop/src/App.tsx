@@ -281,6 +281,7 @@ function App() {
   const [projectsFolder, setProjectsFolder] = useState<string | null>(
     () => localStorage.getItem(PROJECTS_FOLDER_KEY),
   );
+  const automaticUpdatesAvailable = false;
   const [update, setUpdate] = useState<Update | null>(null);
   const [updating, setUpdating] = useState(false);
   // The one update this run acts on: found once, downloaded eagerly so the
@@ -298,7 +299,8 @@ function App() {
   // broken can still be rescued by an update. `tauri dev` serves the vite dev
   // build and skips the check entirely.
   const findUpdate = useCallback(async () => {
-    if (!import.meta.env.PROD || found.current) return found.current?.update ?? null;
+    // This fork has no signed update channel yet. Never install upstream builds.
+    if (!automaticUpdatesAvailable || !import.meta.env.PROD || found.current) return found.current?.update ?? null;
     const next = await check();
     if (next && !found.current) {
       found.current = { update: next, ready: next.download().then(() => true, () => false) };
@@ -310,6 +312,7 @@ function App() {
   useEffect(() => {
     // At launch and every six hours after: the app stays open for days, and a
     // missing or unreachable endpoint fails silently on these timed checks.
+    if (!automaticUpdatesAvailable) return;
     findUpdate().catch(() => {});
     const timer = setInterval(() => findUpdate().catch(() => {}), 6 * 60 * 60 * 1000);
     return () => clearInterval(timer);
@@ -341,6 +344,10 @@ function App() {
   // timed checks, this one answers even when there is nothing to install.
   useEffect(() => {
     const unlisten = listen("menu:check-updates", async () => {
+      if (!automaticUpdatesAvailable) {
+        await message("Automatic updates are not available for this fork yet. Update from the babgev/nurb source checkout.", { title: "nurb" });
+        return;
+      }
       // The dev build never checks, so saying "newest version" would be a lie.
       if (!import.meta.env.PROD) return;
       try {

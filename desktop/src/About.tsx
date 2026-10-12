@@ -78,8 +78,8 @@ export default function About({
         <div className="about-body">
           <p className="about-links">
             <ExternalLink href="https://nurb.dev">nurb.dev</ExternalLink>
-            <ExternalLink href="https://github.com/Shpigford/nurb">github</ExternalLink>
-            <ExternalLink href="https://github.com/Shpigford/nurb/issues/new/choose">
+            <ExternalLink href="https://github.com/babgev/nurb">github</ExternalLink>
+            <ExternalLink href="https://github.com/babgev/nurb/issues/new/choose">
               report an issue
             </ExternalLink>
             <button className="about-copy" onClick={copyDebugInfo}>

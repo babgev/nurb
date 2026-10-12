@@ -1,0 +1,47 @@
+name: desktop
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            desktop/package-lock.json
+            desktop/adapter-runtime/package-lock.json
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+      - run: npm ci --no-fund --no-audit
+        working-directory: desktop
+      - run: npm run build && npm test
+        working-directory: desktop
+      - run: npm ci --include=optional --no-fund --no-audit
+        working-directory: desktop/adapter-runtime
+      - name: Check bundled agents start
+        working-directory: desktop/adapter-runtime
+        run: |
+          node node_modules/.bin/claude-agent-acp --version
+          node node_modules/.bin/claude-agent-acp --cli --version
+          node node_modules/.bin/codex-acp --version
+          node node_modules/.bin/codex --version
+          node node_modules/.bin/gemini --version
+      - run: npm run stage
+        working-directory: desktop
+      - run: cargo test --locked
+        working-directory: desktop/src-tauri

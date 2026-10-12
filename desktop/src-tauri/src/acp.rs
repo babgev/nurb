@@ -19,7 +19,7 @@ use agent_client_protocol::schema::v1::{
     ListSessionsRequest, LoadSessionRequest, Meta, NewSessionRequest, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigSelectOptions,
-    SessionId, SessionNotification, SetSessionConfigOptionRequest, TextContent,
+    SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, TextContent,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
@@ -105,7 +105,7 @@ struct ChatSession {
     channel: Channel<ChatEvent>,
     /// The model and effort this session is actually running on, as the agent
     /// last reported them.
-    config: Mutex<Vec<ConfigRow>>,
+    config: Arc<Mutex<Vec<ConfigRow>>>,
     /// Per-model effort menus from Grok's initialize `_meta.modelState`. Empty
     /// for agents that speak ACP config options. Needed because switching Grok's
     /// model rebuilds the effort list, and `session/set_model` does not return
@@ -993,6 +993,19 @@ fn rows(options: &[SessionConfigOption]) -> Vec<ConfigRow> {
         .collect()
 }
 
+fn update_config(
+    current: &Mutex<Vec<ConfigRow>>,
+    update: &SessionUpdate,
+) -> Option<Vec<ConfigRow>> {
+    let SessionUpdate::ConfigOptionUpdate(update) = update else {
+        return None;
+    };
+    // ACP sends the complete set, including removal of options.
+    let updated = rows(&update.config_options);
+    *current.lock().unwrap() = updated.clone();
+    Some(updated)
+}
+
 /// Put the user's remembered picks onto a session the moment it exists, before
 /// the first prompt can go out on the wrong model. A pick the agent no longer
 /// offers (a model dropped from an account's allowlist) is skipped, leaving the
@@ -1077,8 +1090,8 @@ pub fn chat_config(
 }
 
 /// Remember a pick and, when a session is running, move it there now. The
-/// choice is stored either way, so it still lands on the next session if this
-/// chat has not started one yet. Addressed by category, since that is the key
+/// choice is stored after the live agent accepts it, or validated against the
+/// cached menu if this chat has not started yet. Addressed by category, since that is the key
 /// the picker and the store share; the agent's own option id comes from the
 /// live session's list.
 #[tauri::command]
@@ -1091,18 +1104,24 @@ pub async fn set_chat_config(
 ) -> Result<Vec<ConfigRow>, String> {
     use tauri::Manager;
     let kind = AgentKind::parse(&agent)?;
-    app.state::<PrefStore>()
-        .remember(kind.id(), &category, &value);
-    let live = session_id.and_then(|id| {
-        let sessions = app.state::<Chats>();
-        let sessions = sessions.sessions.lock().unwrap();
-        sessions.get(&id).and_then(|chat| {
+    let live = session_id
+        .map(|id| {
+            let sessions = app.state::<Chats>();
+            let sessions = sessions.sessions.lock().unwrap();
+            let chat = sessions.get(&id).ok_or("chat is not running")?;
+            if chat.agent != kind {
+                return Err("chat belongs to another agent");
+            }
             let current = chat.config.lock().unwrap().clone();
             let config_id = current
                 .iter()
-                .find(|row| row.category == category)
-                .map(|row| row.id.clone())?;
-            Some((
+                .find(|row| {
+                    row.category == category
+                        && row.options.iter().any(|choice| choice.value == value)
+                })
+                .map(|row| row.id.clone())
+                .ok_or("This choice is no longer available. Choose another model or effort.")?;
+            Ok((
                 id.clone(),
                 chat.conn.clone(),
                 chat.session.clone(),
@@ -1112,9 +1131,19 @@ pub async fn set_chat_config(
                 config_id,
             ))
         })
-    });
+        .transpose()?;
     let Some((id, conn, session, agent_kind, menus, current, config_id)) = live else {
-        return Ok(app.state::<PrefStore>().rows(kind.id()));
+        let prefs = app.state::<PrefStore>();
+        let available = prefs.rows(kind.id()).iter().any(|row| {
+            row.category == category && row.options.iter().any(|choice| choice.value == value)
+        });
+        if !available {
+            return Err(
+                "This choice is no longer available. Choose another model or effort.".into(),
+            );
+        }
+        prefs.remember(kind.id(), &category, &value);
+        return Ok(prefs.rows(kind.id()));
     };
     let updated = if agent_kind == AgentKind::Grok {
         set_grok_choice(&conn, &session, &category, &value, &current, &menus)
@@ -1132,7 +1161,12 @@ pub async fn set_chat_config(
             .map_err(|error| friendly(kind, error))?;
         rows(&response.config_options)
     };
-    app.state::<PrefStore>().cache(kind.id(), updated.clone());
+    app.state::<PrefStore>()
+        .replace_cache(kind.id(), updated.clone());
+    if let Some(row) = updated.iter().find(|row| row.category == category) {
+        app.state::<PrefStore>()
+            .remember(kind.id(), &category, &row.value);
+    }
     let sessions = app.state::<Chats>();
     let sessions = sessions.sessions.lock().unwrap();
     if let Some(chat) = sessions.get(&id) {
@@ -1199,10 +1233,16 @@ async fn run_chat(
     let replaying = Arc::new(AtomicBool::new(false));
     let notify_replaying = Arc::clone(&replaying);
     let notify_channel = channel.clone();
+    let notify_app = app.clone();
     let ask_channel = channel.clone();
     let ask_pending = pending.clone();
     let live_session = Arc::new(Mutex::new(None));
     let connected_session = Arc::clone(&live_session);
+    let notify_session = Arc::clone(&live_session);
+    // Shared before session/new so config notifications during startup are
+    // consumed too. Session responses supply the snapshot at each response.
+    let session_config = Arc::new(Mutex::new(Vec::new()));
+    let notify_config = Arc::clone(&session_config);
     let chat_app = app.clone();
     let chat_project = project.clone();
     let chat_pending = pending.clone();
@@ -1214,6 +1254,14 @@ async fn run_chat(
         .builder()
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
+                let matches = notify_session.lock().unwrap().as_ref()
+                    .is_none_or(|id| *id == wire_string(&notification.session_id));
+                let updated = matches.then(|| update_config(&notify_config, &notification.update)).flatten();
+                if let Some(updated) = updated {
+                    use tauri::Emitter;
+                    notify_app.state::<PrefStore>().replace_cache(kind.id(), updated);
+                    let _ = notify_app.emit("agent-config", ());
+                }
                 forward(
                     &notify_channel,
                     notification.update,
@@ -1391,12 +1439,13 @@ async fn run_chat(
                             )
                             .await;
                             let prefs = chat_app.state::<PrefStore>();
-                            prefs.cache(kind.id(), config.clone());
+                            prefs.replace_cache(kind.id(), config.clone());
                             if kind == AgentKind::Grok {
                                 prefs.cache_model_rows(kind.id(), grok_rows_by_model(&menus));
                             }
                             let id = wire_string(&session);
                             *connected_session.lock().unwrap() = Some(id.clone());
+                            *session_config.lock().unwrap() = config;
                             chat_app.state::<Chats>().sessions.lock().unwrap().insert(
                                 id.clone(),
                                 ChatSession {
@@ -1406,7 +1455,7 @@ async fn run_chat(
                                     agent: kind,
                                     pending: chat_pending,
                                     channel: chat_channel,
-                                    config: Mutex::new(config),
+                                    config: session_config,
                                     grok_models: menus,
                                     pgid,
                                     _close: close_tx,
@@ -1619,6 +1668,42 @@ mod tests {
     #[test]
     fn an_agent_that_offers_no_config_yields_no_picker() {
         assert!(rows(&[]).is_empty());
+    }
+
+    #[test]
+    fn live_config_notifications_replace_the_complete_menu() {
+        use agent_client_protocol::schema::v1::SessionNotification;
+        use std::sync::Mutex;
+
+        let current = Mutex::new(rows(
+            &serde_json::from_str::<Vec<SessionConfigOption>>(CLAUDE).unwrap(),
+        ));
+        let notification: SessionNotification = serde_json::from_value(serde_json::json!({
+            "sessionId": "live-session",
+            "update": {
+                "sessionUpdate": "config_option_update",
+                "configOptions": [{
+                    "id": "model", "name": "Model", "category": "model", "type": "select",
+                    "currentValue": "newly-released-model",
+                    "options": [{"value": "newly-released-model", "name": "New model"}]
+                }]
+            }
+        }))
+        .unwrap();
+        let updated = super::update_config(&current, &notification.update).unwrap();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(current.lock().unwrap()[0].value, "newly-released-model");
+        assert_eq!(current.lock().unwrap()[0].options[0].name, "New model");
+
+        let empty: SessionNotification = serde_json::from_value(serde_json::json!({
+            "sessionId": "live-session",
+            "update": {"sessionUpdate": "config_option_update", "configOptions": []}
+        }))
+        .unwrap();
+        assert!(super::update_config(&current, &empty.update)
+            .unwrap()
+            .is_empty());
+        assert!(current.lock().unwrap().is_empty());
     }
 
     /// Grok 1.0.5's session/new, captured off the wire: no `configOptions`,

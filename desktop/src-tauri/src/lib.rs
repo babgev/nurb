@@ -492,8 +492,8 @@ fn install_menu(app: &AppHandle) -> tauri::Result<()> {
                 let _ = app.emit("menu:check-updates", ());
                 return;
             }
-            "help:github" => "https://github.com/Shpigford/nurb",
-            "help:issue" => "https://github.com/Shpigford/nurb/issues/new",
+            "help:github" => "https://github.com/babgev/nurb",
+            "help:issue" => "https://github.com/babgev/nurb/issues/new",
             _ => return,
         };
         let _ = app.opener().open_url(url, None::<&str>);
@@ -506,7 +506,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(acp::Chats::new())

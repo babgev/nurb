@@ -1218,6 +1218,14 @@ textarea {
   color: var(--dimmer);
 }
 
+.chat-config-error {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
 .chat-send {
   font: inherit;
   font-size: 12px;

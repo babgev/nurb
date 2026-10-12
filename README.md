@@ -1,5 +1,7 @@
 # nurb
 
+This is [babgev/nurb](https://github.com/babgev/nurb), a fork of [Shpigford/nurb](https://github.com/Shpigford/nurb). The original authors, license, and CAD engine are preserved. Fork builds use a separate app data directory and do not install upstream desktop updates.
+
 Tell your AI what you need printed. Watch the part take shape live. Print it.
 
 nurb turns the AI you already pay for into a CAD partner for 3D printing. You describe the part in plain words, the AI models it, and nurb checks it against print physics and shows you the result in a live viewer. You judge, drag sliders, click `3mf`, print.
@@ -28,17 +30,29 @@ nurb turns the AI you already pay for into a CAD partner for 3D printing. You de
 
 ## Install
 
-The easiest way in is the Mac app. Download it for [**Apple silicon**](https://github.com/Shpigford/nurb/releases/latest/download/nurb.dmg) or [**Intel Macs**](https://github.com/Shpigford/nurb/releases/latest/download/nurb-intel.dmg). Your projects, your AI, and the live viewer in one window; it sets everything up the first time you open it and updates itself.
-
-For the command line:
+Build this fork from source. You need a current stable Rust toolchain, Node 22.18 or newer, uv, and Xcode command line tools on macOS:
 
 ```bash
-curl -fsSL https://nurb.dev/install.sh | sh
+git clone https://github.com/babgev/nurb.git
+cd nurb
+uv sync --locked --dev
+cd desktop
+npm ci
+npm run tauri dev
 ```
 
-One line, installs everything: uv if you don't have it, nurb, and the agent skill. Prefer your own package manager? `uv tool install nurb` (or `pip install nurb`) does the first half, and `npx skills add shpigford/nurb --skill nurb` teaches whatever AI harnesses you have. Later, `nurb update` upgrades nurb and the installed skill together.
+For the command line and agent skill:
+
+```bash
+uv tool install --force --from git+https://github.com/babgev/nurb.git nurb
+npx skills add babgev/nurb --skill nurb
+```
+
+To update, pull your source checkout and repeat the setup commands, or repeat the tool install command with `--reinstall`. Signed desktop releases and automatic updates are not configured for this fork yet. The original nurb.dev installer, PyPI package, and upstream download links install the original app. The inherited CLI update notice still compares against upstream PyPI; use the source installation above to keep this fork.
 
 ## Which model should you use?
+
+The desktop model and reasoning menus come from your connected agent and update when it reports new choices. Your provider account determines which models are available. This fork updates the bundled agent runtimes, ignores saved choices that are no longer offered, and shows errors when an agent rejects a setting. New provider releases may still require an adapter update; the adapter versions are maintained in `desktop/adapter-runtime/package.json`.
 
 nurb works with whatever AI subscription you already pay for, and they are not equally good at designing parts. We run the popular models through the same real part-design jobs and grade the actual geometry by machine, so you can pick based on what you subscribe to and what you are willing to spend: [nurb.dev/benchmarks](https://nurb.dev/benchmarks.html). The raw rows, transcripts, and grading code live in [Shpigford/nurb-benchmarks](https://github.com/Shpigford/nurb-benchmarks), and adding a row for your model is one line on your own subscription, single runs welcome:
 

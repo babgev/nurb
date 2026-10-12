@@ -789,6 +789,11 @@ mod tests {
         std::fs::create_dir_all(paths.adapters().join("node_modules/.bin")).unwrap();
 
         let node = paths.node_bin();
+        let adapter_version =
+            |kind: crate::agents::AgentKind| kind.adapter().unwrap().rsplit_once('@').unwrap().1;
+        let claude_version = adapter_version(crate::agents::AgentKind::Claude);
+        let codex_version = adapter_version(crate::agents::AgentKind::Codex);
+        let gemini_version = adapter_version(crate::agents::AgentKind::Gemini);
         std::fs::write(
             &node,
             format!(
@@ -800,9 +805,9 @@ case "$*" in
     [ ! -f "$0.slow-claude" ] || sleep 3
     echo "2.1.257 (Claude Code)"
     ;;
-  *"claude-agent-acp --version"*) echo "claude-agent-acp 0.74.0" ;;
-  *"codex-acp --version"*) echo "codex-acp 1.10.0" ;;
-    *"gemini --version"*) echo "0.55.1" ;;
+  *"claude-agent-acp --version"*) echo "claude-agent-acp {claude_version}" ;;
+  *"codex-acp --version"*) echo "codex-acp {codex_version}" ;;
+  *"gemini --version"*) echo "{gemini_version}" ;;
   *"/codex --version"*)
     [ ! -f "$0.missing-codex" ] || exit 1
     echo "codex-cli 0.153.4"
