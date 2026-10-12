@@ -552,6 +552,7 @@ pub fn run() {
             acp::cancel_turn,
             acp::respond_permission,
             acp::chat_config,
+            acp::refresh_chat_config,
             acp::set_chat_config,
             acp::close_chat,
             agents::agent_statuses,

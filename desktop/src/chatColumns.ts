@@ -4,6 +4,7 @@ export type ChatColumn = {
   agent: string | null;
   resume: string | null;
   gen: number;
+  draft?: { text: string; files: string[] };
   // A hidden turn finished with state that has not been shown yet. Keep the
   // mounted column until it is visible so drafts, errors, and replies survive.
   unseen: boolean;

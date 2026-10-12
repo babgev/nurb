@@ -867,9 +867,9 @@ function App() {
   // Bump the part's generation to remount its column without a session to
   // resume. With no agent named ("start fresh") the agent resets too, so the
   // new conversation takes the current default; naming one pins it, which is
-  // how the chat header switches agents. Either way the old conversation stays
+  // how the model picker switches agents. Either way the old conversation stays
   // in its agent's own store.
-  const startFresh = async (path: string, part: string, agent: string | null = null) => {
+  const startFresh = async (path: string, part: string, agent: string | null = null, draft?: ChatColumn["draft"]): Promise<boolean> => {
     try {
       // Persist the empty selection before remounting. Otherwise quitting
       // before the first new prompt would restore the old newest session.
@@ -880,15 +880,16 @@ function App() {
       });
     } catch (e) {
       setError(String(e));
-      return;
+      return false;
     }
     setColumns((list) =>
       list.map((col) =>
         col.path === path && col.part === part
-          ? { ...col, resume: null, agent, gen: col.gen + 1 }
+          ? { ...col, resume: null, agent, draft, gen: col.gen + 1 }
           : col,
       ),
     );
+    return true;
   };
 
   // Track live session ids so switching parts and back resumes the same
@@ -1357,17 +1358,19 @@ function App() {
                 label: AGENT_LABEL[status.id] ?? status.label,
                 loggedIn: status.loggedIn,
               }))}
+            draft={col.draft}
             resume={col.resume}
             hidden={!columnVisible(col)}
             seed={isProject && col.path === active ? projectSeed : null}
             onSeed={isProject ? () => setProjectSeed(null) : undefined}
             onSession={(id) => chatStarted(col.path, col.part, id, agent)}
             onFresh={() => startFresh(col.path, col.part)}
-            onAgent={(id, unstarted) => {
-              // Picking an agent before the first message is choosing which
-              // agent you work with, so it sticks for later chats too.
+            onAgent={async (id, unstarted, draft) => {
+              // Persist the fresh selection before changing a default that can
+              // remount this column. Failure must leave its transcript intact.
+              if (!(await startFresh(col.path, col.part, id, draft))) return false;
               if (unstarted) chooseAgent(id);
-              startFresh(col.path, col.part, id);
+              return true;
             }}
             onBusy={(busy) =>
               chatBusy(col.path, col.part, agent, busy, columnVisible(col))

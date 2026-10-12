@@ -42,3 +42,29 @@ test("submission waits for every paste already being saved", async () => {
   assert.deepEqual(await submitted, ["first.png", "second.png"]);
   assert.deepEqual(shown, []);
 });
+
+
+test("provider changes carry existing and pending attachments into the remounted composer", async () => {
+  let finishPaste!: (paths: string[]) => void;
+  const paste = new Promise<string[]>((resolve) => { finishPaste = resolve; });
+  const original = new AttachmentDraft(() => {}, ["design.stl"]);
+  original.track(paste);
+  const transferred = original.take();
+  finishPaste(["reference.png"]);
+  const files = await transferred;
+  const newComposer = new AttachmentDraft(() => {}, files);
+
+  assert.equal(original.hasContent, false);
+  assert.equal(newComposer.hasContent, true);
+  assert.deepEqual(await newComposer.take(), ["design.stl", "reference.png"]);
+  assert.deepEqual(files, ["design.stl", "reference.png"]);
+});
+
+test("a refused provider switch can restore the original attachments", async () => {
+  let shown: string[] = [];
+  const draft = new AttachmentDraft((files) => { shown = files; }, ["design.stl"]);
+  const transferred = await draft.take();
+  draft.restore(transferred);
+  assert.deepEqual(shown, ["design.stl"]);
+  assert.deepEqual(await draft.take(), ["design.stl"]);
+});

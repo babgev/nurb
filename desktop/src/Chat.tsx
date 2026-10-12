@@ -11,10 +11,11 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
-import { IconChevronDown, IconMessagePlus, IconPaperclip } from "./Icons";
+import { IconMessagePlus, IconPaperclip } from "./Icons";
 import Markdown from "./Markdown";
 import { playChime, shouldPlayCompletionChime } from "./chime";
 import { AttachmentDraft, restoreDraftText } from "./chatDraft";
+import ModelPicker, { type ConfigRow } from "./ModelPicker";
 
 // The whole-project conversation rides the per-part plumbing under a name no part
 // file can have. Twins live in App.tsx's mount and acp.rs's context line.
@@ -46,19 +47,6 @@ type Item =
   | { kind: "note"; text: string };
 
 type Permission = { id: number; title: string; options: PermissionOption[] };
-
-// Mirrors ConfigRow in src-tauri/src/prefs.rs: the model and effort selects,
-// as the agent itself describes them.
-type ConfigChoice = { value: string; name: string; description?: string };
-type ConfigRow = {
-  id: string;
-  // "model" or "thought_level": the key the app addresses a row by, since the
-  // agents name the options themselves differently.
-  category: string;
-  name: string;
-  value: string;
-  options: ConfigChoice[];
-};
 
 // Mirrors AgentKind::label in src-tauri/src/agents.rs.
 export const AGENT_LABEL: Record<string, string> = {
@@ -111,14 +99,6 @@ const KIND_VERBS: Record<string, [string, string]> = {
 
 const basename = (path: string) => path.split("/").pop() ?? path;
 
-// The button's own label: the selected names, not the model ids, since those
-// are the agent's wire values and mean nothing to someone printing a bracket.
-function summarize(config: ConfigRow[]): string {
-  return config
-    .map((row) => row.options.find((o) => o.value === row.value)?.name ?? row.value)
-    .join(" · ");
-}
-
 // mode 0 is the activity form for cards ("editing lid"); mode 1 the plain verb
 // form for permission dialogs ("edit lid").
 function describe(title: string, kind: string | undefined, mode: 0 | 1): string {
@@ -136,6 +116,7 @@ function Chat({
   agent,
   agents,
   resume,
+  draft,
   hidden,
   seed,
   onSeed,
@@ -152,9 +133,10 @@ function Chat({
   // Fixed for the life of the conversation: a resumed session keeps the agent
   // that ran it, a fresh one takes the default from the agents pane.
   agent: string;
-  // Everything the app can host, for the header's switcher.
+  // Installed providers offered together in the model picker.
   agents: { id: string; label: string; loggedIn: boolean | null }[];
   resume: string | null;
+  draft?: { text: string; files: string[] };
   hidden: boolean;
   // Text waiting for the composer, from a viewer nudge. Prefilled when the column
   // is visible, never sent; onSeed reports it landed so the owner clears it.
@@ -165,7 +147,7 @@ function Chat({
   // Switching agents cannot move a conversation across two different session
   // stores, so it starts a fresh one on the agent picked. `unstarted` is true
   // when nothing has been said yet, which makes the pick the new default.
-  onAgent: (id: string, unstarted: boolean) => void;
+  onAgent: (id: string, unstarted: boolean, draft: { text: string; files: string[] }) => Promise<boolean>;
   onBusy: (busy: boolean) => void;
   onSignIn: (agent: string) => Promise<boolean>;
 }) {
@@ -185,10 +167,10 @@ function Chat({
   const [signingIn, setSigningIn] = useState(false);
   const [permissions, setPermissions] = useState<Permission[]>([]);
   // Absolute paths; the Rust side reads them at send time.
-  const [attachments, setAttachments] = useState<string[]>([]);
+  const [attachments, setAttachments] = useState<string[]>(draft?.files ?? []);
   const attachmentDraftRef = useRef<AttachmentDraft | null>(null);
   if (!attachmentDraftRef.current) {
-    attachmentDraftRef.current = new AttachmentDraft(setAttachments);
+    attachmentDraftRef.current = new AttachmentDraft(setAttachments, draft?.files);
   }
   const attachmentDraft = attachmentDraftRef.current;
   const [dropping, setDropping] = useState(false);
@@ -198,8 +180,13 @@ function Chat({
   const [configError, setConfigError] = useState<string | null>(null);
   const [configuring, setConfiguring] = useState(false);
   const configuringRef = useRef(false);
-  const [picking, setPicking] = useState(false);
-  const [switching, setSwitching] = useState(false);
+  const [providerConfigs, setProviderConfigs] = useState<Record<string, ConfigRow[]>>({});
+  const [providerLoading, setProviderLoading] = useState<Record<string, boolean>>({});
+  const [providerErrors, setProviderErrors] = useState<Record<string, string | null>>({});
+  const discoveryRef = useRef(new Set<string>());
+  const discoveryStartedRef = useRef(false);
+  const configRequestsRef = useRef<Record<string, number>>({});
+  const providerIds = agents.map((option) => option.id).join(",");
   const sessionRef = useRef<string | null>(null);
   // A resume id is single-use after the adapter accepts it. Authentication
   // failures retain it; a dead resumed session must not replay it again.
@@ -290,6 +277,7 @@ function Chat({
     // or one drop would attach to every conversation.
     if (hidden) return;
     const unlisten = getCurrentWebview().onDragDropEvent((event) => {
+      if (configuringRef.current) { setDropping(false); return; }
       if (event.payload.type === "enter") setDropping(true);
       if (event.payload.type === "leave") setDropping(false);
       if (event.payload.type === "drop") {
@@ -399,28 +387,61 @@ function Chat({
     }
   }, []);
 
-  const refreshConfig = useCallback(() => {
-    invoke<ConfigRow[]>("chat_config", { agent, sessionId: sessionRef.current })
-      .then(setConfig)
-      .catch((error) => setConfigError(`Could not load model choices: ${String(error)}`));
+  const readConfig = useCallback(async (id: string) => {
+    const request = (configRequestsRef.current[id] ?? 0) + 1;
+    configRequestsRef.current[id] = request;
+    try {
+      const rows = await invoke<ConfigRow[]>("chat_config", {
+        agent: id,
+        sessionId: id === agent ? sessionRef.current : null,
+      });
+      if (closedRef.current || configRequestsRef.current[id] !== request || (id === agent && configuringRef.current)) return;
+      setProviderConfigs((current) => ({ ...current, [id]: rows }));
+      if (id === agent) setConfig(rows);
+    } catch (error) {
+      if (!closedRef.current && configRequestsRef.current[id] === request) {
+        setProviderErrors((current) => ({ ...current, [id]: String(error) }));
+      }
+    }
   }, [agent]);
 
-  useEffect(refreshConfig, [refreshConfig]);
+  const refreshConfig = useCallback(() => { void readConfig(agent); }, [agent, readConfig]);
 
   useEffect(() => {
-    // The lists arrive from the project's session-list probe, which can land
-    // after this column mounted. Without this the first chat opened on a fresh
-    // install has no picker until something else remounts it.
-    const unlisten = listen("agent-config", () => refreshConfig());
-    return () => {
-      unlisten.then((stop) => stop());
-    };
-  }, [refreshConfig]);
+    for (const id of new Set([...providerIds.split(",").filter(Boolean), agent])) void readConfig(id);
+  }, [providerIds, agent, readConfig]);
+
+  useEffect(() => {
+    const unlisten = listen("agent-config", () => {
+      for (const id of new Set([...providerIds.split(",").filter(Boolean), agent])) void readConfig(id);
+    });
+    return () => { unlisten.then((stop) => stop()); };
+  }, [providerIds, agent, readConfig]);
+
+  const discoverModels = async (id?: string) => {
+    const ids = id ? [id] : providerIds.split(",").filter(Boolean);
+    await Promise.all(ids.map(async (provider) => {
+      if (discoveryRef.current.has(provider)) return;
+      discoveryRef.current.add(provider);
+      setProviderLoading((current) => ({ ...current, [provider]: true }));
+      setProviderErrors((current) => ({ ...current, [provider]: null }));
+      try {
+        await invoke<ConfigRow[]>("refresh_chat_config", { path, agent: provider });
+        await readConfig(provider);
+      } catch (error) {
+        if (!closedRef.current) setProviderErrors((current) => ({ ...current, [provider]: String(error) }));
+      } finally {
+        discoveryRef.current.delete(provider);
+        if (!closedRef.current) setProviderLoading((current) => ({ ...current, [provider]: false }));
+      }
+    }));
+  };
 
   const pick = useCallback(
     async (category: string, value: string) => {
-      if (configuringRef.current) return;
+      if (configuringRef.current || sendingRef.current || startRef.current) return;
       configuringRef.current = true;
+      configRequestsRef.current[agent] = (configRequestsRef.current[agent] ?? 0) + 1;
       setConfiguring(true);
       setConfigError(null);
       // Optimistic: the round trip goes through the adapter, and a select that
@@ -440,6 +461,7 @@ function Chat({
       } catch (error) {
         setConfigError(`Could not change this setting: ${String(error)}`);
         refreshConfig();
+        throw error;
       } finally {
         configuringRef.current = false;
         setConfiguring(false);
@@ -447,6 +469,39 @@ function Chat({
     },
     [agent, refreshConfig],
   );
+
+  const selectModel = async (target: string, value: string) => {
+    if (configuringRef.current || sendingRef.current || startRef.current || busy || starting) return;
+    if (target === agent) {
+      await pick("model", value);
+      return;
+    }
+    configuringRef.current = true;
+    setConfiguring(true);
+    setConfigError(null);
+    let files: string[] = [];
+    try {
+      // Save the accepted choice before remounting. A fresh session applies it
+      // before its first prompt, while the old provider keeps its own history.
+      await invoke<ConfigRow[]>("set_chat_config", {
+        agent: target, sessionId: null, category: "model", value,
+      });
+      files = await attachmentDraft.take();
+      const transferred = await onAgent(target, items.length === 0 && !resumeRef.current && !sessionRef.current, {
+        text: inputRef.current?.value ?? "", files,
+      });
+      if (!transferred) {
+        throw new Error("Your conversation and draft are still here. Try switching providers again.");
+      }
+    } catch (error) {
+      attachmentDraft.restore(files);
+      setConfigError(`Could not switch providers: ${String(error)}`);
+      throw error;
+    } finally {
+      configuringRef.current = false;
+      if (!closedRef.current) setConfiguring(false);
+    }
+  };
 
   const ensureSession = useCallback(async () => {
     if (sessionRef.current) return sessionRef.current;
@@ -676,63 +731,13 @@ function Chat({
         <span className="chat-header-left">
           <span className="chat-header-label">{isProject ? "project" : part}</span>
           <span aria-hidden="true">·</span>
-          {agents.length > 1 ? (
-            <span className="chat-switcher">
-              <button
-                type="button"
-                className="chat-switcher-button"
-                aria-expanded={switching}
-                disabled={busy || starting}
-                title={
-                  items.length > 0
-                    ? "switch agents, which starts a fresh conversation"
-                    : "switch agents"
-                }
-                onClick={() => setSwitching((open) => !open)}
-              >
-                {label}
-                <IconChevronDown />
-              </button>
-              {switching && (
-                <>
-                  <div className="chat-switcher-away" onClick={() => setSwitching(false)} />
-                  <div className="chat-switcher-menu">
-                    {agents.map((option) => (
-                      <button
-                        key={option.id}
-                        type="button"
-                        className={
-                          option.id === agent ? "chat-switcher-item current" : "chat-switcher-item"
-                        }
-                        onClick={() => {
-                          setSwitching(false);
-                          if (option.id !== agent) onAgent(option.id, items.length === 0);
-                        }}
-                      >
-                        {option.label}
-                        {option.loggedIn === false && (
-                          <span className="chat-switcher-hint">sign in</span>
-                        )}
-                      </button>
-                    ))}
-                    {items.length > 0 && (
-                      <p className="chat-switcher-note">
-                        Switching starts a fresh conversation. This one is kept.
-                      </p>
-                    )}
-                  </div>
-                </>
-              )}
-            </span>
-          ) : (
-            <span>{label}</span>
-          )}
+          <span>{label}</span>
         </span>
         {items.length > 0 && (
           <button
             className="chat-fresh"
             title="set this conversation aside and start a fresh one"
-            disabled={busy || starting}
+            disabled={busy || starting || configuring}
             onClick={onFresh}
           >
             <IconMessagePlus />
@@ -903,6 +908,7 @@ function Chat({
                   type="button"
                   className="chat-attachment-remove"
                   aria-label={`remove ${basename(path)}`}
+                  disabled={configuring}
                   onClick={() => attachmentDraft.remove(path)}
                 >
                   ×
@@ -913,6 +919,7 @@ function Chat({
         )}
         <textarea
           ref={inputRef}
+          defaultValue={draft?.text ?? ""}
           className="chat-input"
           placeholder={
             busy
@@ -924,7 +931,7 @@ function Chat({
                 : `Describe or change ${isProject ? "the project" : part}…`
           }
           rows={2}
-          disabled={starting}
+          disabled={starting || configuring}
           onKeyDown={keydown}
           onPaste={paste}
         />
@@ -934,64 +941,36 @@ function Chat({
             className="chat-attach"
             title="attach photos or files"
             aria-label="attach photos or files"
-            disabled={starting}
+            disabled={starting || configuring}
             onClick={attach}
           >
             <IconPaperclip />
           </button>
-          {(config.length > 0 || configError) && (
-            <div className="chat-config">
-              <button
-                type="button"
-                className="chat-config-button"
-                aria-expanded={picking}
-                title={config.length ? `${label} is set to ${summarize(config)}` : "Model settings"}
-                onClick={() => setPicking((open) => !open)}
-              >
-                {summarize(config) || "model settings"}
-              </button>
-              {picking && (
-                <>
-                  {/* Click-away, rather than a document listener that has to be
-                      taught which clicks are its own. */}
-                  <div className="chat-config-away" onClick={() => setPicking(false)} />
-                  <div className="chat-config-menu">
-                    {config.map((row) => {
-                      const selected = row.options.find((option) => option.value === row.value);
-                      return (
-                        <label key={row.category} className="chat-config-row">
-                          <span>{row.name}</span>
-                          <select
-                            value={row.value}
-                            disabled={busy || starting || configuring}
-                            onChange={(event) => pick(row.category, event.target.value)}
-                          >
-                            {row.options.map((option) => (
-                              <option key={option.value} value={option.value}>
-                                {option.name}
-                              </option>
-                            ))}
-                          </select>
-                          {row.category === "model" && (
-                            <span className="chat-config-detail">
-                              {selected?.description && <span>{selected.description}</span>}
-                              <span>Provider ID: <code>{row.value}</code></span>
-                            </span>
-                          )}
-                        </label>
-                      );
-                    })}
-                    <p className="chat-config-note">
-                      {busy
-                        ? `Wait for ${label} to finish to change these.`
-                        : "Bigger models and higher effort use up your plan faster."}
-                    </p>
-                    {configError && <p className="chat-config-error" role="alert">{configError}</p>}
-                  </div>
-                </>
-              )}
-            </div>
-          )}
+          <ModelPicker
+            agent={agent}
+            config={config}
+            providers={agents.map((provider) => ({
+              ...provider,
+              config: provider.id === agent ? config : providerConfigs[provider.id] ?? [],
+              loading: providerLoading[provider.id] ?? false,
+              error: providerErrors[provider.id] ?? null,
+            }))}
+            disabled={busy || starting || configuring}
+            configuring={configuring}
+            error={configError}
+            hasConversation={items.length > 0 || Boolean(resume)}
+            onSelectModel={selectModel}
+            onSelectConfig={pick}
+            onRefresh={discoverModels}
+            onSignIn={async (id) => {
+              if (await onSignIn(id)) await discoverModels(id);
+            }}
+            onOpen={() => {
+              if (discoveryStartedRef.current || !providerIds) return;
+              discoveryStartedRef.current = true;
+              void discoverModels();
+            }}
+          />
           {busy ? (
             <button type="button" className="chat-send chat-stop" onClick={cancel}>
               stop

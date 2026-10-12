@@ -13,8 +13,9 @@ export class AttachmentDraft {
   private pending: Promise<string[]>[] = [];
   private readonly onChange: (files: string[]) => void;
 
-  constructor(onChange: (files: string[]) => void) {
+  constructor(onChange: (files: string[]) => void, files: string[] = []) {
     this.onChange = onChange;
+    this.files = [...files];
   }
 
   get hasContent(): boolean {

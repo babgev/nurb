@@ -204,7 +204,7 @@ pub async fn list_sessions(
             (
                 kind,
                 tauri::async_runtime::spawn(async move {
-                    agent_sessions(&launcher, kind, project).await
+                    agent_sessions(&launcher, kind, project, false).await
                 }),
             )
         })
@@ -267,6 +267,7 @@ async fn agent_sessions(
     launcher: &crate::env::Launcher,
     kind: AgentKind,
     project: PathBuf,
+    models_only: bool,
 ) -> Result<
     (
         Vec<agent_client_protocol::schema::v1::SessionInfo>,
@@ -316,7 +317,7 @@ async fn agent_sessions(
                     // asking here is what lets the very first chat of a fresh
                     // install open with a working picker. Failure (a signed-out
                     // Codex answers -32000) just means no picker.
-                    let config = cx
+                    let discovered = cx
                         .send_request(NewSessionRequest::new(project.clone()))
                         .block_task()
                         .await
@@ -326,9 +327,13 @@ async fn agent_sessions(
                                 session.meta.as_ref(),
                                 init.meta.as_ref(),
                             )
-                        })
-                        .unwrap_or_else(|_| grok_rows(None, init.meta.as_ref()));
-                    if init.agent_capabilities.session_capabilities.list.is_none() {
+                        });
+                    let config = match discovered {
+                        Ok(config) => config,
+                        Err(error) if models_only && menus.is_empty() => return Err(error),
+                        Err(_) => grok_rows(None, init.meta.as_ref()),
+                    };
+                    if models_only || init.agent_capabilities.session_capabilities.list.is_none() {
                         return Ok((Vec::new(), config, model_rows));
                     }
                     let mut sessions = Vec::new();
@@ -350,7 +355,14 @@ async fn agent_sessions(
     .await;
     reap(pgid, child).await;
     listed
-        .map_err(|_| "timed out listing conversations".to_string())?
+        .map_err(|_| {
+            if models_only {
+                "Timed out loading models. Try refreshing this provider."
+            } else {
+                "timed out listing conversations"
+            }
+            .to_string()
+        })?
         .map_err(|error| friendly(kind, error))
 }
 
@@ -1069,6 +1081,27 @@ async fn apply_choices(
     current
 }
 
+/// Refresh one provider independently without sending a prompt or listing history.
+#[tauri::command]
+pub async fn refresh_chat_config(
+    app: tauri::AppHandle,
+    path: String,
+    agent: String,
+) -> Result<Vec<ConfigRow>, String> {
+    use tauri::{Emitter, Manager};
+    let kind = AgentKind::parse(&agent)?;
+    let launcher = app.state::<crate::env::Launcher>().inner().clone();
+    let (_, config, model_rows) =
+        agent_sessions(&launcher, kind, PathBuf::from(path), true).await?;
+    let prefs = app.state::<PrefStore>();
+    prefs.replace_cache(kind.id(), config);
+    if kind == AgentKind::Grok {
+        prefs.cache_model_rows(kind.id(), model_rows);
+    }
+    let _ = app.emit("agent-config", ());
+    Ok(prefs.rows(kind.id()))
+}
+
 /// What the picker draws. A part's chat has no adapter until its first message,
 /// so with no session running this answers from the remembered lists.
 #[tauri::command]
@@ -1083,6 +1116,9 @@ pub fn chat_config(
         let sessions = app.state::<Chats>();
         let sessions = sessions.sessions.lock().unwrap();
         if let Some(chat) = sessions.get(&id) {
+            if chat.agent != kind {
+                return Err("chat belongs to another agent".into());
+            }
             return Ok(chat.config.lock().unwrap().clone());
         }
     }
