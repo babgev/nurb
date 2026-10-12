@@ -1671,6 +1671,45 @@ mod tests {
     }
 
     #[test]
+    fn provider_versions_descriptions_and_alias_ids_reach_the_picker_unchanged() {
+        let options: Vec<SessionConfigOption> = serde_json::from_value(serde_json::json!([{
+            "id": "model", "name": "Model", "category": "model", "type": "select",
+            "currentValue": "default",
+            "options": [
+                {"value": "default", "name": "Default (recommended)", "description": "Opus"},
+                {"value": "opus", "name": "Opus 5.5", "description": "Opus 5.5 with 1M context"},
+                {"value": "fable", "name": "Fable 5.1"},
+                {"value": "sonnet", "name": "Sonnet 5.5"},
+                {"value": "haiku", "name": "Haiku 5.5"}
+            ]
+        }]))
+        .unwrap();
+        let config = rows(&options);
+        let model = &config[0];
+        assert_eq!(model.value, "default");
+        assert_eq!(
+            model
+                .options
+                .iter()
+                .map(|choice| choice.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Default (recommended)",
+                "Opus 5.5",
+                "Fable 5.1",
+                "Sonnet 5.5",
+                "Haiku 5.5"
+            ]
+        );
+        assert_eq!(model.options[0].description.as_deref(), Some("Opus"));
+        assert_eq!(model.options[1].value, "opus");
+        assert_eq!(
+            model.options[1].description.as_deref(),
+            Some("Opus 5.5 with 1M context")
+        );
+    }
+
+    #[test]
     fn live_config_notifications_replace_the_complete_menu() {
         use agent_client_protocol::schema::v1::SessionNotification;
         use std::sync::Mutex;

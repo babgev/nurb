@@ -956,22 +956,31 @@ function Chat({
                       taught which clicks are its own. */}
                   <div className="chat-config-away" onClick={() => setPicking(false)} />
                   <div className="chat-config-menu">
-                    {config.map((row) => (
-                      <label key={row.category} className="chat-config-row">
-                        <span>{row.name}</span>
-                        <select
-                          value={row.value}
-                          disabled={busy || starting || configuring}
-                          onChange={(event) => pick(row.category, event.target.value)}
-                        >
-                          {row.options.map((option) => (
-                            <option key={option.value} value={option.value}>
-                              {option.name}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                    ))}
+                    {config.map((row) => {
+                      const selected = row.options.find((option) => option.value === row.value);
+                      return (
+                        <label key={row.category} className="chat-config-row">
+                          <span>{row.name}</span>
+                          <select
+                            value={row.value}
+                            disabled={busy || starting || configuring}
+                            onChange={(event) => pick(row.category, event.target.value)}
+                          >
+                            {row.options.map((option) => (
+                              <option key={option.value} value={option.value}>
+                                {option.name}
+                              </option>
+                            ))}
+                          </select>
+                          {row.category === "model" && (
+                            <span className="chat-config-detail">
+                              {selected?.description && <span>{selected.description}</span>}
+                              <span>Provider ID: <code>{row.value}</code></span>
+                            </span>
+                          )}
+                        </label>
+                      );
+                    })}
                     <p className="chat-config-note">
                       {busy
                         ? `Wait for ${label} to finish to change these.`
