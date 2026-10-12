@@ -94,6 +94,7 @@ type Pending = Arc<Mutex<HashMap<u32, oneshot::Sender<RequestPermissionOutcome>>
 
 pub struct Chats {
     sessions: Mutex<HashMap<String, ChatSession>>,
+    starting: Mutex<HashMap<String, oneshot::Sender<()>>>,
 }
 
 struct ChatSession {
@@ -121,6 +122,7 @@ impl Chats {
     pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            starting: Mutex::new(HashMap::new()),
         }
     }
 
@@ -143,6 +145,7 @@ pub async fn start_chat(
     agent: String,
     on_event: Channel<ChatEvent>,
     resume: Option<String>,
+    startup_id: Option<String>,
 ) -> Result<String, String> {
     let kind = AgentKind::parse(&agent)?;
     let project = PathBuf::from(&path);
@@ -152,6 +155,11 @@ pub async fn start_chat(
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
     let (ready_tx, ready_rx) = oneshot::channel();
     let (close_tx, close_rx) = oneshot::channel();
+    let (startup_tx, startup_rx) = oneshot::channel();
+    if let Some(id) = &startup_id {
+        use tauri::Manager;
+        app.state::<Chats>().starting.lock().unwrap().insert(id.clone(), startup_tx);
+    }
     tauri::async_runtime::spawn(run_chat(
         app.clone(),
         project.clone(),
@@ -162,9 +170,14 @@ pub async fn start_chat(
         ready_tx,
         close_tx,
         close_rx,
+        startup_rx,
     ));
-    ready_rx
-        .await
+    let ready = ready_rx.await;
+    if let Some(id) = startup_id {
+        use tauri::Manager;
+        app.state::<Chats>().starting.lock().unwrap().remove(&id);
+    }
+    ready
         .map_err(|_| format!("{} exited before it was ready", kind.label()))?
         .map_err(|error| friendly(kind, error))
 }
@@ -1212,6 +1225,14 @@ pub async fn set_chat_config(
 }
 
 #[tauri::command]
+pub fn cancel_chat_start(app: tauri::AppHandle, startup_id: String) {
+    use tauri::Manager;
+    if let Some(cancel) = app.state::<Chats>().starting.lock().unwrap().remove(&startup_id) {
+        let _ = cancel.send(());
+    }
+}
+
+#[tauri::command]
 pub fn close_chat(app: tauri::AppHandle, session_id: String) {
     use tauri::Manager;
     // Dropping the entry drops the close sender; the connection task sees it,
@@ -1237,6 +1258,7 @@ async fn run_chat(
     ready_tx: oneshot::Sender<Ready>,
     close_tx: oneshot::Sender<()>,
     close_rx: oneshot::Receiver<()>,
+    startup_rx: oneshot::Receiver<()>,
 ) {
     use tauri::Manager;
     let launcher = app.state::<crate::env::Launcher>();
@@ -1251,6 +1273,7 @@ async fn run_chat(
             config = config.env("GEMINI_API_KEY", key);
         }
     }
+    let _ = channel.send(ChatEvent::Activity { phase: format!("Launching {}", kind.label()) });
     let agent = AcpAgent::new(config);
     let (stdin, stdout, stderr, child) = match agent.spawn_process() {
         Ok(spawned) => spawned,
@@ -1286,12 +1309,13 @@ async fn run_chat(
     let mut ready_tx = Some(ready_tx);
     let mut close_tx = Some(close_tx);
 
-    let result = Client
+    let connection = Client
         .builder()
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
                 let matches = notify_session.lock().unwrap().as_ref()
                     .is_none_or(|id| *id == wire_string(&notification.session_id));
+                if !matches { return Ok(()); }
                 let updated = matches.then(|| update_config(&notify_config, &notification.update)).flatten();
                 if let Some(updated) = updated {
                     use tauri::Emitter;
@@ -1377,6 +1401,7 @@ async fn run_chat(
                 let chat_channel = chat_channel.clone();
                 async move {
                     let session = async {
+                        let _ = chat_channel.send(ChatEvent::Activity { phase: format!("Connecting to {}", kind.label()) });
                         let init = cx
                             .send_request(InitializeRequest::new(ProtocolVersion::V1))
                             .block_task()
@@ -1395,6 +1420,7 @@ async fn run_chat(
                             // the user an empty conversation.
                             let restored = if init.agent_capabilities.load_session {
                                 let requested = SessionId::new(id.clone());
+                                let _ = chat_channel.send(ChatEvent::Activity { phase: "Loading conversation history".into() });
                                 load_replaying.store(true, Ordering::Relaxed);
                                 let mut request =
                                     LoadSessionRequest::new(requested.clone(), project.clone());
@@ -1439,6 +1465,7 @@ async fn run_chat(
                                 }
                             }
                         }
+                        let _ = chat_channel.send(ChatEvent::Activity { phase: "Opening conversation".into() });
                         let mut request = NewSessionRequest::new(project);
                         if let Some(meta) = open_meta {
                             request = request.meta(meta);
@@ -1465,6 +1492,7 @@ async fn run_chat(
                             // Before ready_tx: the picker's choice has to be on
                             // the session by the time the first prompt can go
                             // out, or the opening turn runs on the wrong model.
+                            let _ = chat_channel.send(ChatEvent::Activity { phase: "Applying model settings".into() });
                             let config = apply_choices(
                                 &cx,
                                 &session,
@@ -1521,8 +1549,11 @@ async fn run_chat(
                     }
                 }
             },
-        )
-        .await;
+        );
+    let (was_cancelled, result) = tokio::select! {
+        result = connection => (false, result),
+        _ = startup_cancelled(startup_rx) => (true, Ok(live_session.lock().unwrap().clone())),
+    };
 
     // Whichever way the connection ended, take the process tree with it.
     reap(pgid, child).await;
@@ -1541,6 +1572,7 @@ async fn run_chat(
             .lock()
             .unwrap()
             .remove(&session_id);
+        if was_cancelled { return; }
         let error = ChatEvent::SessionError {
             message: format!(
                 "{} stopped unexpectedly. Send a message to start a fresh chat.",
@@ -1549,6 +1581,13 @@ async fn run_chat(
         };
         events::mirror(&error);
         let _ = channel.send(error);
+    }
+}
+
+async fn startup_cancelled(receiver: oneshot::Receiver<()>) {
+    if receiver.await.is_err() {
+        // Dropping a completed startup token is not a cancellation.
+        std::future::pending::<()>().await;
     }
 }
 
@@ -1617,6 +1656,19 @@ fn friendly(kind: AgentKind, error: agent_client_protocol::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn startup_cancellation_is_explicit_and_completed_tokens_do_not_kill_sessions() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            sender.send(()).unwrap();
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(20), super::startup_cancelled(receiver)).await.is_ok());
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            drop(sender);
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(20), super::startup_cancelled(receiver)).await.is_err());
+        });
+    }
+
     use super::{
         attachment_block, friendly, grok_open_meta, grok_rows, picker_rows, rows, with_grok_choice,
         AgentKind,

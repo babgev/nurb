@@ -25,6 +25,7 @@ type Props = {
   providers: ModelPickerProvider[];
   config: ConfigRow[];
   disabled: boolean;
+  activeProviderBusy?: boolean;
   configuring?: boolean;
   error?: string | null;
   hasConversation?: boolean;
@@ -45,7 +46,7 @@ function selectedName(row: ConfigRow | undefined) {
 }
 
 export default function ModelPicker({
-  agent, providers, config, disabled, configuring = false, error, hasConversation = false,
+  agent, providers, config, disabled, activeProviderBusy = false, configuring = false, error, hasConversation = false,
   onSelectModel, onSelectConfig, onRefresh, onSignIn, onOpen,
 }: Props) {
   const [open, setOpen] = useState(false);
@@ -195,7 +196,7 @@ export default function ModelPicker({
                   type="button"
                   data-model
                   className={`model-picker-option${selected ? " selected" : ""}`}
-                  disabled={locked || provider.loggedIn === false}
+                  disabled={locked || provider.loggedIn === false || (activeProviderBusy && provider.id === agent)}
                   aria-pressed={selected}
                   aria-label={`${model.name}, ${provider.label}${selected ? ", selected" : ""}`}
                   title={[model.description, `${provider.label} · ${model.value}`].filter(Boolean).join("\n")}
@@ -226,7 +227,7 @@ export default function ModelPicker({
             {settings.map((row) => (
               <label className="model-picker-setting" key={row.category}>
                 <span>{row.name}</span>
-                <select value={row.value} disabled={locked} onChange={(event) => act(() => onSelectConfig(row.category, event.target.value))}>
+                <select value={row.value} disabled={locked || activeProviderBusy} onChange={(event) => act(() => onSelectConfig(row.category, event.target.value))}>
                   {row.options.map((option) => <option key={option.value} value={option.value}>{option.name}</option>)}
                 </select>
               </label>
@@ -234,7 +235,7 @@ export default function ModelPicker({
           </div>}
           <div className="model-picker-footer">
             {activeDescription && <p className="model-picker-description">{activeDescription}</p>}
-            <p>{disabled ? "Wait for this turn to finish to change models." : hasConversation ? "Changing providers starts a new conversation. This one is kept." : "Choose a model from any connected provider."}</p>
+            <p>{disabled ? "Applying model settings…" : activeProviderBusy ? "Choose another provider to open a tab while this agent continues." : hasConversation ? "Changing providers opens a new tab. Both share the project files." : "Choose a model from any connected provider."}</p>
             {(actionError || error) && <p className="model-picker-error" role="alert">{actionError || error}</p>}
             <button type="button" disabled={locked || providers.some((provider) => provider.loading)} onClick={() => act(() => onRefresh())}>Refresh models</button>
           </div>

@@ -550,6 +550,7 @@ pub fn run() {
             acp::list_sessions,
             acp::send_prompt,
             acp::cancel_turn,
+            acp::cancel_chat_start,
             acp::respond_permission,
             acp::chat_config,
             acp::refresh_chat_config,

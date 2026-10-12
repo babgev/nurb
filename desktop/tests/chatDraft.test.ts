@@ -68,3 +68,15 @@ test("a refused provider switch can restore the original attachments", async () 
   assert.deepEqual(shown, ["design.stl"]);
   assert.deepEqual(await draft.take(), ["design.stl"]);
 });
+
+
+test("opening another provider tab copies pending attachments without consuming the source draft", async () => {
+  let finish!: (paths: string[]) => void;
+  const draft = new AttachmentDraft(() => {}, ["model.stl"]);
+  draft.track(new Promise<string[]>((resolve) => { finish = resolve; }));
+  const copied = draft.snapshot();
+  finish(["reference.png"]);
+  assert.deepEqual(await copied, ["model.stl", "reference.png"]);
+  assert.equal(draft.hasContent, true);
+  assert.deepEqual(await draft.take(), ["model.stl", "reference.png"]);
+});

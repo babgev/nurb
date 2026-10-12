@@ -1,4 +1,4 @@
-# nurb desktop
+# Nurb Fork desktop
 
 A Tauri shell around nurb: project rail, agent chat column, and the live viewer in one window.
 
@@ -25,6 +25,21 @@ Release builds never touch the dev environment. On first launch the app provisio
 
 Debug-build test overrides, never compiled into release: `NURB_DESKTOP_PROVISIONED=1` makes a debug build use the provisioned environment, and `NURB_DESKTOP_DATA=<dir>` points the whole app (registry, sessions, provisioned env) at a scratch directory.
 
+## Install or update the Mac app
+
+From `desktop/`, with the same build prerequisites as development:
+
+```sh
+npm ci
+npm run install:mac
+```
+
+This builds a locally signed release and replaces `/Applications/Nurb Fork.app`. If the app is running, the installer leaves it alone and prints a command to install the completed build after you quit it. It verifies the bundle identifier and signature before replacing anything, then keeps the previous app in `~/Library/Caches/io.github.babgev.nurb/app-backups/`. It never replaces the upstream `/Applications/nurb.app`. To install an already-built bundle, run `npm run install:mac -- "/path/to/Nurb Fork.app"`.
+
+Every fork update uses the same `io.github.babgev.nurb` identity, app data directory, and Gemini Keychain service. Your existing project folders, project list, conversations, settings, and credentials remain in place. Open Nurb Fork from Applications when installation finishes. To roll back, quit the app and pass the previous bundle's path to the same installer; rollback does not restore older project files or app data.
+
+The rail and About dialog identify this as `babgev fork 2`, alongside the upstream engine version `0.26.0`. Increment `FORK_BUILD` in `src/forkIdentity.ts` for a new fork revision; the engine version remains synchronized with the Python package and bundled skill.
+
 ## Release
 
 This fork uses the app identifier `io.github.babgev.nurb` and its own Gemini Keychain service, so its preferences and Gemini API key are separate from the upstream app. Existing projects can be opened from their folders.
@@ -33,4 +48,4 @@ Signed releases and automatic updates are disabled until this fork has its own s
 
 To enable distribution, configure a fork-owned updater public key and endpoint in `src-tauri/tauri.conf.json`, enable `createUpdaterArtifacts` there and `automaticUpdatesAvailable` in `src/App.tsx`, register the Tauri updater plugin in `src-tauri/src/lib.rs`, and supply your own Apple signing and notarization credentials as described by `.env.example`. Create the versioned GitHub release in `babgev/nurb` before running `scripts/release.sh`; the fork does not publish the upstream `nurb` package on PyPI. The script builds Apple silicon and Intel artifacts and publishes its update feed to `babgev/nurb`.
 
-Until then, update a source checkout with `git pull`, `npm ci`, and `npm run tauri dev`. Release builds bundle the Python wheel from this checkout rather than downloading the upstream package.
+Until then, update a source checkout with `git pull`, then run `npm ci` and `npm run install:mac` in `desktop/`. Release builds bundle the Python wheel from this checkout rather than downloading the upstream package.

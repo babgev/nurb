@@ -2,6 +2,7 @@ import {
   ClipboardEvent,
   FormEvent,
   KeyboardEvent,
+  type ReactNode,
   useCallback,
   useEffect,
   useRef,
@@ -15,6 +16,8 @@ import { IconMessagePlus, IconPaperclip } from "./Icons";
 import Markdown from "./Markdown";
 import { playChime, shouldPlayCompletionChime } from "./chime";
 import { AttachmentDraft, restoreDraftText } from "./chatDraft";
+import { activityStatus, elapsedLabel, mergeTool, type ToolItem } from "./chatActivity";
+import "./ChatActivity.css";
 import ModelPicker, { type ConfigRow } from "./ModelPicker";
 
 // The whole-project conversation rides the per-part plumbing under a name no part
@@ -23,13 +26,14 @@ export const PROJECT_CHAT = "//project";
 
 // Mirrors ChatEvent in src-tauri/src/acp.rs.
 type ChatEvent =
+  | { type: "activity"; phase: string }
   | { type: "user_text"; text: string }
   | { type: "agent_text"; text: string }
   | { type: "agent_thought"; text: string }
   | { type: "session_info"; title: string | null }
   | { type: "note"; text: string }
   | { type: "tool_call"; id: string; title: string; kind?: string; status: string; input?: string; output?: string }
-  | { type: "tool_call_update"; id: string; title?: string; status?: string; input?: string; output?: string }
+  | { type: "tool_call_update"; id: string; title?: string; kind?: string; status?: string; input?: string; output?: string }
   | { type: "plan"; entries: PlanEntry[] }
   | { type: "permission_request"; id: number; title: string; options: PermissionOption[] }
   | { type: "permission_resolved"; id: number }
@@ -42,7 +46,7 @@ type Item =
   | { kind: "user"; text: string; files?: string[]; localId?: number }
   | { kind: "agent"; text: string }
   | { kind: "thought"; text: string }
-  | { kind: "tool"; id: string; title: string; toolKind?: string; status: string; input?: string; output?: string }
+  | ToolItem
   | { kind: "plan"; entries: PlanEntry[] }
   | { kind: "note"; text: string };
 
@@ -62,6 +66,7 @@ const TOOL_STATUS_LABEL: Record<string, string> = {
   in_progress: "working…",
   completed: "done",
   failed: "failed",
+  interrupted: "stopped",
 };
 
 // Tool titles arrive as developer-speak ("Edit parts/lid.py", "nurb check").
@@ -125,6 +130,11 @@ function Chat({
   onAgent,
   onBusy,
   onSignIn,
+  tabBar,
+  onModel,
+  onDraft,
+  onConfig,
+  initialConfig,
 }: {
   path: string;
   // The column's identity: this is the part's conversation, whatever the
@@ -147,9 +157,14 @@ function Chat({
   // Switching agents cannot move a conversation across two different session
   // stores, so it starts a fresh one on the agent picked. `unstarted` is true
   // when nothing has been said yet, which makes the pick the new default.
-  onAgent: (id: string, unstarted: boolean, draft: { text: string; files: string[] }) => Promise<boolean>;
+  onAgent: (id: string, unstarted: boolean, draft: { text: string; files: string[] }, model: string) => Promise<boolean>;
   onBusy: (busy: boolean) => void;
   onSignIn: (agent: string) => Promise<boolean>;
+  tabBar?: ReactNode;
+  onModel?: (label: string) => void;
+  onDraft?: (draft: { text: string; files: string[] }) => void;
+  onConfig?: (values: Record<string, string>) => void;
+  initialConfig?: Record<string, string>;
 }) {
   const label = AGENT_LABEL[agent] ?? agent;
   // Known signed out, not merely unknown: an unknown status stays quiet.
@@ -159,6 +174,19 @@ function Chat({
   const isProject = part === PROJECT_CHAT;
   const [items, setItems] = useState<Item[]>([]);
   const [busy, setBusy] = useState(false);
+  const [phase, setPhase] = useState("");
+  const [clock, setClock] = useState(Date.now());
+  const [lastEventAt, setLastEventAt] = useState(Date.now());
+  const [turnStartedAt, setTurnStartedAt] = useState(Date.now());
+  const [cancelledAt, setCancelledAt] = useState<number | null>(null);
+  const cancelRef = useRef(false);
+  const choicesRef = useRef<Record<string, string>>({ ...initialConfig });
+  const onDraftRef = useRef(onDraft);
+  onDraftRef.current = onDraft;
+  const onModelRef = useRef(onModel);
+  onModelRef.current = onModel;
+  const onConfigRef = useRef(onConfig);
+  onConfigRef.current = onConfig;
   // A resumed transcript starts loading after the first paint, so treat it as
   // starting immediately rather than briefly exposing a live composer.
   const [starting, setStarting] = useState(Boolean(resume));
@@ -200,6 +228,7 @@ function Chat({
   // In-flight start, shared across StrictMode's double mount so a resume on
   // mount cannot spawn two adapters.
   const startRef = useRef<Promise<string> | null>(null);
+  const startupIdRef = useRef<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   // Latest callbacks behind stable refs so ensureSession never goes stale.
@@ -207,6 +236,25 @@ function Chat({
   onSessionRef.current = onSession;
   const onBusyRef = useRef(onBusy);
   onBusyRef.current = onBusy;
+
+  useEffect(() => {
+    if (!busy && !starting) return;
+    const timer = window.setInterval(() => setClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [busy, starting]);
+
+  useEffect(() => {
+    onDraftRef.current?.({ text: inputRef.current?.value ?? "", files: attachments });
+  }, [attachments]);
+
+  useEffect(() => {
+    const row = config.find((row) => row.category === "model");
+    const name = row?.options.find((option) => option.value === row.value)?.name;
+    if (name) onModelRef.current?.(name);
+    if (config.length) onConfigRef.current?.(Object.fromEntries(config.map((row) => [row.category, row.value])));
+  }, [config]);
+
+  const publishDraft = () => onDraftRef.current?.({ text: inputRef.current?.value ?? "", files: attachments });
 
   useEffect(() => {
     // A removed column cannot leave a stale rail dot behind. Turn transitions
@@ -220,6 +268,8 @@ function Chat({
     closedRef.current = false;
     return () => {
       closedRef.current = true;
+      const startup = startupIdRef.current;
+      if (startup) invoke("cancel_chat_start", { startupId: startup }).catch(() => {});
       const session = sessionRef.current;
       sessionRef.current = null;
       if (session) invoke("close_chat", { sessionId: session }).catch(() => {});
@@ -292,7 +342,13 @@ function Chat({
   }, [hidden, attachmentDraft]);
 
   const applyEvent = useCallback((event: ChatEvent) => {
+    const now = Date.now();
+    setLastEventAt(now);
+    setClock(now);
     switch (event.type) {
+      case "activity":
+        setPhase(event.phase);
+        break;
       case "user_text":
         // Only replayed history carries user chunks; live turns render the
         // composer text directly in send().
@@ -312,6 +368,7 @@ function Chat({
         break;
       case "agent_text":
       case "agent_thought": {
+        setPhase(event.type === "agent_text" ? "Receiving response" : "Receiving provider thinking update");
         const kind = event.type === "agent_text" ? "agent" : "thought";
         setItems((list) => {
           const last = list[list.length - 1];
@@ -323,34 +380,15 @@ function Chat({
         break;
       }
       case "tool_call":
-        setItems((list) => [
-          ...list,
-          {
-            kind: "tool",
-            id: event.id,
-            title: event.title,
-            toolKind: event.kind,
-            status: event.status,
-            input: event.input,
-            output: event.output,
-          },
-        ]);
-        break;
       case "tool_call_update":
-        // Absent fields mean unchanged; present ones replace (ACP semantics).
-        setItems((list) =>
-          list.map((item) =>
-            item.kind === "tool" && item.id === event.id
-              ? {
-                  ...item,
-                  title: event.title ?? item.title,
-                  status: event.status ?? item.status,
-                  input: event.input ?? item.input,
-                  output: event.output ?? item.output,
-                }
-              : item,
-          ),
-        );
+        setPhase(`Waiting for ${label}'s next update`);
+        setItems((list) => {
+          const index = list.findIndex((item) => item.kind === "tool" && item.id === event.id);
+          const previous = index < 0 ? undefined : list[index] as ToolItem;
+          const tool = mergeTool(previous, event, now, restoringRef.current);
+          if (index < 0) return [...list, tool];
+          return list.map((item, at) => at === index ? tool : item);
+        });
         break;
       case "plan":
         setItems((list) => {
@@ -379,13 +417,16 @@ function Chat({
         setPermissions((list) => list.filter((p) => p.id !== event.id));
         break;
       case "session_error":
+        setBusy(false);
+        onBusyRef.current(false);
+        setPermissions([]);
         // The dead session is gone from the Rust map too; forgetting it here
         // is what lets the next send start the fresh chat the note promises.
         sessionRef.current = null;
         setItems((list) => [...list, { kind: "note", text: event.message }]);
         break;
     }
-  }, []);
+  }, [label]);
 
   const readConfig = useCallback(async (id: string) => {
     const request = (configRequestsRef.current[id] ?? 0) + 1;
@@ -397,7 +438,14 @@ function Chat({
       });
       if (closedRef.current || configRequestsRef.current[id] !== request || (id === agent && configuringRef.current)) return;
       setProviderConfigs((current) => ({ ...current, [id]: rows }));
-      if (id === agent) setConfig(rows);
+      if (id === agent) {
+        const chosen = sessionRef.current ? rows : rows.map((row) => {
+          const value = choicesRef.current[row.category];
+          return value && row.options.some((option) => option.value === value) ? { ...row, value } : row;
+        });
+        choicesRef.current = Object.fromEntries(chosen.map((row) => [row.category, row.value]));
+        setConfig(chosen);
+      }
     } catch (error) {
       if (!closedRef.current && configRequestsRef.current[id] === request) {
         setProviderErrors((current) => ({ ...current, [id]: String(error) }));
@@ -450,14 +498,15 @@ function Chat({
         rows.map((row) => (row.category === category ? { ...row, value } : row)),
       );
       try {
-        setConfig(
-          await invoke<ConfigRow[]>("set_chat_config", {
-            agent,
-            sessionId: sessionRef.current,
-            category,
-            value,
-          }),
-        );
+        const rows = await invoke<ConfigRow[]>("set_chat_config", {
+          agent, sessionId: sessionRef.current, category, value,
+        });
+        choicesRef.current[category] = value;
+        setConfig(rows.map((row) => {
+          const own = choicesRef.current[row.category];
+          return !sessionRef.current && own && row.options.some((option) => option.value === own)
+            ? { ...row, value: own } : row;
+        }));
       } catch (error) {
         setConfigError(`Could not change this setting: ${String(error)}`);
         refreshConfig();
@@ -471,8 +520,9 @@ function Chat({
   );
 
   const selectModel = async (target: string, value: string) => {
-    if (configuringRef.current || sendingRef.current || startRef.current || busy || starting) return;
+    if (configuringRef.current) return;
     if (target === agent) {
+      if (sendingRef.current || startRef.current || busy || starting) return;
       await pick("model", value);
       return;
     }
@@ -481,20 +531,19 @@ function Chat({
     setConfigError(null);
     let files: string[] = [];
     try {
-      // Save the accepted choice before remounting. A fresh session applies it
-      // before its first prompt, while the old provider keeps its own history.
+      // Validate the choice before opening a tab. The new tab applies its own
+      // selection before prompting, while this conversation stays mounted.
       await invoke<ConfigRow[]>("set_chat_config", {
         agent: target, sessionId: null, category: "model", value,
       });
-      files = await attachmentDraft.take();
+      files = await attachmentDraft.snapshot();
       const transferred = await onAgent(target, items.length === 0 && !resumeRef.current && !sessionRef.current, {
         text: inputRef.current?.value ?? "", files,
-      });
+      }, value);
       if (!transferred) {
         throw new Error("Your conversation and draft are still here. Try switching providers again.");
       }
     } catch (error) {
-      attachmentDraft.restore(files);
       setConfigError(`Could not switch providers: ${String(error)}`);
       throw error;
     } finally {
@@ -512,7 +561,12 @@ function Chat({
       const requestedResume = resumeRef.current;
       restoringRef.current = Boolean(requestedResume);
       setStarting(true);
+      setLastEventAt(Date.now());
+      setTurnStartedAt(Date.now());
+      setPhase(requestedResume ? "Restoring conversation" : `Connecting to ${label}`);
       try {
+        const startupId = crypto.randomUUID();
+        startupIdRef.current = startupId;
         const onEvent = new Channel<ChatEvent>();
         onEvent.onmessage = applyEvent;
         const session = await invoke<string>("start_chat", {
@@ -520,6 +574,7 @@ function Chat({
           agent,
           onEvent,
           resume: requestedResume,
+          startupId,
         });
         if (closedRef.current) {
           // The user switched projects while the adapter was starting; without
@@ -529,19 +584,43 @@ function Chat({
         }
         sessionRef.current = session;
         resumeRef.current = null;
+        restoringRef.current = false;
+        if (cancelRef.current) {
+          await invoke("close_chat", { sessionId: session });
+          sessionRef.current = null;
+          throw new Error("Stopped before sending. Send your message again when ready.");
+        }
+        // Each tab owns its selection even when another tab changed provider defaults.
+        try {
+          if (!requestedResume) {
+            for (const [category, value] of Object.entries(choicesRef.current).sort(([a], [b]) => Number(b === "model") - Number(a === "model"))) {
+              const rows = await invoke<ConfigRow[]>("set_chat_config", { agent, sessionId: session, category, value });
+              setConfig(rows);
+            }
+          }
+          if (cancelRef.current) throw new Error("Stopped before sending. Send your message again when ready.");
+        } catch (error) {
+          sessionRef.current = null;
+          await invoke("close_chat", { sessionId: session }).catch(() => {});
+          throw error;
+        }
         onSessionRef.current(session);
         // The live session is authoritative: it may have clamped a remembered
         // pick the account no longer offers.
         refreshConfig();
         return session;
+      } catch (error) {
+        if (cancelRef.current) throw new Error("Stopped before sending the message.");
+        throw error;
       } finally {
+        startupIdRef.current = null;
         startRef.current = null;
         setStarting(false);
       }
     })();
     startRef.current = start;
     return start;
-  }, [path, agent, applyEvent, refreshConfig]);
+  }, [path, agent, label, applyEvent, refreshConfig]);
 
   const restoreSession = useCallback(async () => {
     try {
@@ -559,13 +638,19 @@ function Chat({
 
   useEffect(() => {
     // A history session replays its transcript when it opens, not on the first send; reuse this path after sign-in.
-    if (resume) restoreSession();
-  }, [resume, restoreSession]);
+    if (resume && !hidden && !sessionRef.current) restoreSession();
+  }, [resume, hidden, restoreSession]);
 
   const send = useCallback(
     async (text: string, files: string[]) => {
       sendingRef.current = true;
       const startedAt = Date.now();
+      cancelRef.current = false;
+      setCancelledAt(null);
+      setTurnStartedAt(startedAt);
+      setLastEventAt(startedAt);
+      setClock(startedAt);
+      setPhase(`Waiting for ${label}'s response`);
       const localId = nextLocalIdRef.current++;
       setItems((list) => [
         ...list,
@@ -582,13 +667,16 @@ function Chat({
       let completed = false;
       try {
         const session = await ensureSession();
-        await invoke<string>("send_prompt", {
+        if (cancelRef.current) throw new Error("Stopped before sending. Send your message again when ready.");
+        setPhase(`Waiting for ${label}'s response`);
+        const stopReason = await invoke<string>("send_prompt", {
           sessionId: session,
           text,
           part: part ?? null,
           attachments: files,
         });
-        completed = true;
+        completed = stopReason !== "cancelled";
+        if (stopReason === "cancelled") setItems((list) => [...list, { kind: "note", text: "Turn stopped." }]);
       } catch (e) {
         const message = String(e);
         if (message.includes("auth_required")) {
@@ -610,12 +698,14 @@ function Chat({
         setBusy(false);
         onBusyRef.current(false);
         setPermissions([]);
+        setItems((list) => list.map((item) => item.kind === "tool" && ["pending", "in_progress"].includes(item.status)
+          ? { ...item, status: "interrupted", finishedAt: Date.now() } : item));
         // Only successful turns long enough to wander away from earn a chime;
         // quick back-and-forth and failures should stay quiet.
         if (shouldPlayCompletionChime(completed, Date.now() - startedAt)) playChime();
       }
     },
-    [ensureSession, part, attachmentDraft],
+    [ensureSession, part, attachmentDraft, label],
   );
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
@@ -637,6 +727,7 @@ function Chat({
     // send while a pasted image is still crossing the IPC boundary.
     sendingRef.current = true;
     if (box) box.value = "";
+    publishDraft();
     const files = await attachmentDraft.take();
     if (!text && files.length === 0) {
       sendingRef.current = false;
@@ -683,9 +774,31 @@ function Chat({
     }
   };
 
-  const cancel = () => {
+  const cancel = async () => {
+    cancelRef.current = true;
+    setCancelledAt(Date.now());
     const session = sessionRef.current;
-    if (session) invoke("cancel_turn", { sessionId: session }).catch(() => {});
+    if (!session && startupIdRef.current) {
+      await invoke("cancel_chat_start", { startupId: startupIdRef.current }).catch((error) =>
+        setItems((list) => [...list, { kind: "note", text: `Could not stop connection: ${String(error)}` }]),
+      );
+    }
+    if (session) {
+      try { await invoke("cancel_turn", { sessionId: session }); }
+      catch (error) { setItems((list) => [...list, { kind: "note", text: `Could not stop: ${String(error)}` }]); }
+    }
+  };
+
+  const disconnect = async () => {
+    const session = sessionRef.current;
+    if (!session) return;
+    try {
+      await invoke("close_chat", { sessionId: session });
+      sessionRef.current = null;
+      setItems((list) => [...list, { kind: "note", text: "Disconnected the agent. Your files and conversation history are kept. Send a message to reconnect." }]);
+    } catch (error) {
+      setItems((list) => [...list, { kind: "note", text: `Could not disconnect: ${String(error)}` }]);
+    }
   };
 
   const signIn = async () => {
@@ -723,6 +836,11 @@ function Chat({
     }).catch(() => {});
   };
 
+  const activity = activityStatus({ label, starting, restoring: restoringRef.current,
+    cancelling: cancelledAt !== null, permission: permissions.length > 0, phase,
+    lastEventAt, now: clock, tools: items.filter((item): item is ToolItem => item.kind === "tool"),
+  });
+
   return (
     <section className={hidden ? "chat chat-hidden" : "chat"}>
       <div className="chat-header" data-tauri-drag-region>
@@ -736,15 +854,16 @@ function Chat({
         {items.length > 0 && (
           <button
             className="chat-fresh"
-            title="set this conversation aside and start a fresh one"
+            title="open a new conversation tab sharing the same project files"
             disabled={busy || starting || configuring}
             onClick={onFresh}
           >
             <IconMessagePlus />
-            start fresh
+            new tab
           </button>
         )}
       </div>
+      {tabBar}
       <div className="chat-transcript" ref={scrollRef}>
         {items.length === 0 && !busy && (
           <div className="chat-empty">
@@ -793,32 +912,21 @@ function Chat({
                 </details>
               );
             case "tool": {
-              const shown = describe(item.title, item.toolKind, 0);
-              // The collapsed row is plain language; the expansion is the raw
-              // material (command, output), untranslated on purpose. The raw
-              // title only earns a line when the row paraphrased it away.
-              const raw = item.input ?? (shown === item.title ? undefined : item.title);
-              if (!raw && !item.output) {
-                return (
-                  <div key={index} className={`chat-tool ${item.status}`}>
-                    <span className="chat-tool-title">{shown}</span>
-                    <span className="chat-tool-status">
-                      {TOOL_STATUS_LABEL[item.status] ?? item.status}
-                    </span>
-                  </div>
-                );
-              }
+              const duration = item.startedAt === undefined ? null : elapsedLabel((item.finishedAt ?? clock) - item.startedAt);
               return (
                 <details key={index} className={`chat-tool expandable ${item.status}`}>
                   <summary>
-                    <span className="chat-tool-title">{shown}</span>
-                    <span className="chat-tool-status">
-                      {TOOL_STATUS_LABEL[item.status] ?? item.status}
+                    <span className="chat-tool-heading">
+                      <span className="chat-tool-title" title={item.title}>{item.title}</span>
+                      {item.input && item.input !== item.title && <code className="chat-tool-preview" title={item.input}>{item.input}</code>}
                     </span>
+                    {duration && <span className="chat-tool-duration">{duration}</span>}
+                    <span className="chat-tool-status">{TOOL_STATUS_LABEL[item.status] ?? item.status}</span>
                   </summary>
                   <div className="chat-tool-detail">
-                    {raw && <pre className="chat-tool-input">{raw}</pre>}
-                    {item.output && <pre className="chat-tool-output">{item.output}</pre>}
+                    {item.input && <><span className="chat-tool-detail-label">Command / input</span><pre className="chat-tool-input">{item.input}</pre></>}
+                    {item.output ? <><span className="chat-tool-detail-label">Output</span><pre className="chat-tool-output">{item.output}</pre></>
+                      : <span className="chat-activity-detail">No output reported by the provider.</span>}
                   </div>
                 </details>
               );
@@ -841,18 +949,16 @@ function Chat({
               );
           }
         })}
-        {starting && (
-          <div className="chat-status">
-            {restoringRef.current ? "restoring conversation…" : `starting ${label}…`}
-          </div>
-        )}
-        {/* A first build can run ten minutes or more; a silent transcript
-            reads as a hang, so the turn keeps a heartbeat on screen. Hidden
-            while a dialog is up, since then it is the user's move. */}
-        {busy && !starting && permissions.length === 0 && (
-          <div className="chat-working">
-            <span className="chat-working-dot" aria-hidden="true" />
-            {label} is working…
+        {(busy || starting) && (
+          <div className={`chat-activity${activity.quiet ? " quiet" : ""}`} role="status" aria-live="polite">
+            <div className="chat-activity-main">
+              <span className="chat-activity-title">{activity.title}</span>
+              <span className="chat-activity-time">{elapsedLabel(clock - turnStartedAt)}</span>
+            </div>
+            <div className="chat-activity-detail">{activity.detail}</div>
+            {cancelledAt !== null && clock - cancelledAt >= 5000 && sessionRef.current && (
+              <button type="button" className="chat-activity-disconnect" onClick={disconnect}>Disconnect agent</button>
+            )}
           </div>
         )}
         {authNeeded !== "none" && (
@@ -923,7 +1029,7 @@ function Chat({
           className="chat-input"
           placeholder={
             busy
-              ? `${label} is working…`
+              ? "Write your next message…"
               : starting
                 ? restoringRef.current
                   ? "Restoring conversation…"
@@ -932,6 +1038,7 @@ function Chat({
           }
           rows={2}
           disabled={starting || configuring}
+          onChange={publishDraft}
           onKeyDown={keydown}
           onPaste={paste}
         />
@@ -955,7 +1062,8 @@ function Chat({
               loading: providerLoading[provider.id] ?? false,
               error: providerErrors[provider.id] ?? null,
             }))}
-            disabled={busy || starting || configuring}
+            disabled={configuring}
+            activeProviderBusy={busy || starting}
             configuring={configuring}
             error={configError}
             hasConversation={items.length > 0 || Boolean(resume)}
@@ -971,9 +1079,9 @@ function Chat({
               void discoverModels();
             }}
           />
-          {busy ? (
-            <button type="button" className="chat-send chat-stop" onClick={cancel}>
-              stop
+          {busy || starting ? (
+            <button type="button" className="chat-send chat-stop" onClick={cancel} disabled={cancelledAt !== null}>
+              {cancelledAt !== null ? "stopping…" : "stop"}
             </button>
           ) : (
             <button type="submit" className="chat-send" disabled={starting || configuring}>

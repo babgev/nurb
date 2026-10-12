@@ -50,6 +50,8 @@ npx skills add babgev/nurb --skill nurb
 
 To update, pull your source checkout and repeat the setup commands, or repeat the tool install command with `--reinstall`. Signed desktop releases and automatic updates are not configured for this fork yet. The original nurb.dev installer, PyPI package, and upstream download links install the original app. The inherited CLI update notice still compares against upstream PyPI; use the source installation above to keep this fork.
 
+For a Mac app in Applications, run `npm ci` and `npm run install:mac` from `desktop/`. Each update replaces `/Applications/Nurb Fork.app` and preserves the fork's projects, conversations, and settings. The app shows its `babgev fork` build number in the rail and About dialog. See the [desktop installation instructions](desktop/README.md#install-or-update-the-mac-app) for prerequisites, backups, and installing an already-built bundle.
+
 ## Which model should you use?
 
 The desktop model and reasoning menus come from your connected agent and update when it reports new choices. Your provider account determines which models are available. This fork updates the bundled agent runtimes, ignores saved choices that are no longer offered, and shows errors when an agent rejects a setting. New provider releases may still require an adapter update; the adapter versions are maintained in `desktop/adapter-runtime/package.json`.
