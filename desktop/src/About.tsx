@@ -2,6 +2,7 @@ import { useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import Logo from "./Logo";
+import { FORK_LABEL, FORK_NAME } from "./forkIdentity";
 import lgpl from "./licenses/OCCT_LICENSE_LGPL_21.txt?raw";
 import occtException from "./licenses/OCCT_LGPL_EXCEPTION.txt?raw";
 import uvMit from "./licenses/UV_LICENSE_MIT.txt?raw";
@@ -42,7 +43,7 @@ export default function About({
 }: Props) {
   const [copied, setCopied] = useState(false);
   const debugInfo = [
-    `app ${appVersion}`,
+    `${FORK_NAME} ${appVersion} · ${FORK_LABEL}`,
     `CAD engine ${nurbVersion}`,
     occtVersion ? `OCCT ${occtVersion}` : null,
     `macOS ${osVersion} (${arch})`,
@@ -67,19 +68,22 @@ export default function About({
         <div className="about-head">
           <Logo size={36} />
           <div>
-            <div className="about-title">nurb</div>
+            <div className="about-title">{FORK_NAME}</div>
             <div className="about-versions">
               {appVersion === nurbVersion
-                ? `version ${appVersion}`
-                : `app ${appVersion} · CAD engine ${nurbVersion}`}
+                ? `${appVersion} · ${FORK_LABEL}`
+                : `app ${appVersion} · ${FORK_LABEL} · CAD engine ${nurbVersion}`}
             </div>
           </div>
         </div>
         <div className="about-body">
+          <p>
+            A fork of nurb maintained in <ExternalLink href="https://github.com/babgev/nurb">babgev/nurb</ExternalLink>. Updates replace this app and keep your projects, conversations, and settings.
+          </p>
           <p className="about-links">
             <ExternalLink href="https://nurb.dev">nurb.dev</ExternalLink>
-            <ExternalLink href="https://github.com/Shpigford/nurb">github</ExternalLink>
-            <ExternalLink href="https://github.com/Shpigford/nurb/issues/new/choose">
+            <ExternalLink href="https://github.com/babgev/nurb">github</ExternalLink>
+            <ExternalLink href="https://github.com/babgev/nurb/issues/new/choose">
               report an issue
             </ExternalLink>
             <button className="about-copy" onClick={copyDebugInfo}>

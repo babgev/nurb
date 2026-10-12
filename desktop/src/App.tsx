@@ -9,11 +9,16 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import About from "./About";
 import AgentsHelp from "./AgentsHelp";
 import Chat, { AGENT_LABEL, PROJECT_CHAT } from "./Chat";
+import ConversationTabs from "./ConversationTabs";
+import { FORK_LABEL } from "./forkIdentity";
 import GeminiKeyDialog from "./GeminiKeyDialog";
 import {
   chatKey,
   markChatSeen,
-  retainChatColumns,
+  CHAT_TABS_KEY,
+  closeChatTab,
+  readChatTabs,
+  selectedChat,
   updateChatActivity,
   type ChatColumn,
 } from "./chatColumns";
@@ -80,9 +85,8 @@ type AboutInfo = {
 };
 
 // What a project's session list says to resume, per part: the newest recorded
-// session's id and the agent that owns it. There is no visible session list;
-// each part has one rolling conversation, picked up where it left off. Built
-// once per project open, then only read to seed columns.
+// session's id and the agent that owns it. Used only to seed the first tab when
+// no saved tabs exist, so upgrading preserves the previous conversation.
 type PartChat = { id: string | null; agent: string | null };
 type ResumeState = { path: string; byPart: Record<string, PartChat> };
 
@@ -179,13 +183,18 @@ function App() {
   >(null);
   const [error, setError] = useState<string | null>(null);
   const [resumeState, setResumeState] = useState<ResumeState | null>(null);
-  // Chat columns opened this run. Columns stay mounted when the selection
-  // moves away, so a part's agent keeps working in the background; only the
-  // selected part's column is visible. A column whose agent is mid-turn even
-  // survives a project switch (issue: creating a project used to kill a
-  // 30-minute run in the previous one). A hidden completed column stays until
-  // shown, preserving results and unsent drafts that session history cannot.
-  const [columns, setColumns] = useState<ChatColumn[]>([]);
+  // Stable tab identities keep each adapter, transcript, and draft mounted.
+  const [savedTabs] = useState(() => readChatTabs(localStorage.getItem(CHAT_TABS_KEY)));
+  const [columns, setColumns] = useState<ChatColumn[]>(savedTabs.columns);
+  const [selectedTabs, setSelectedTabs] = useState(savedTabs.selected);
+  const [closedTabs, setClosedTabs] = useState<ChatColumn[]>(() => readChatTabs(localStorage.getItem(`${CHAT_TABS_KEY}-closed`)).columns);
+  useEffect(() => {
+    try {
+      localStorage.setItem(CHAT_TABS_KEY, JSON.stringify({ columns, selected: selectedTabs }));
+      localStorage.setItem(`${CHAT_TABS_KEY}-closed`, JSON.stringify({ columns: closedTabs, selected: {} }));
+    }
+    catch { setError("Could not save conversation tabs. Keep this window open to preserve unsent drafts."); }
+  }, [columns, selectedTabs, closedTabs]);
   const [busyChats, setBusyChats] = useState<Record<string, boolean>>({});
   // A ref for effects that must read the latest busy map without re-running on
   // every activity update.
@@ -281,6 +290,7 @@ function App() {
   const [projectsFolder, setProjectsFolder] = useState<string | null>(
     () => localStorage.getItem(PROJECTS_FOLDER_KEY),
   );
+  const automaticUpdatesAvailable = false;
   const [update, setUpdate] = useState<Update | null>(null);
   const [updating, setUpdating] = useState(false);
   // The one update this run acts on: found once, downloaded eagerly so the
@@ -298,7 +308,8 @@ function App() {
   // broken can still be rescued by an update. `tauri dev` serves the vite dev
   // build and skips the check entirely.
   const findUpdate = useCallback(async () => {
-    if (!import.meta.env.PROD || found.current) return found.current?.update ?? null;
+    // This fork has no signed update channel yet. Never install upstream builds.
+    if (!automaticUpdatesAvailable || !import.meta.env.PROD || found.current) return found.current?.update ?? null;
     const next = await check();
     if (next && !found.current) {
       found.current = { update: next, ready: next.download().then(() => true, () => false) };
@@ -310,6 +321,7 @@ function App() {
   useEffect(() => {
     // At launch and every six hours after: the app stays open for days, and a
     // missing or unreachable endpoint fails silently on these timed checks.
+    if (!automaticUpdatesAvailable) return;
     findUpdate().catch(() => {});
     const timer = setInterval(() => findUpdate().catch(() => {}), 6 * 60 * 60 * 1000);
     return () => clearInterval(timer);
@@ -341,6 +353,10 @@ function App() {
   // timed checks, this one answers even when there is nothing to install.
   useEffect(() => {
     const unlisten = listen("menu:check-updates", async () => {
+      if (!automaticUpdatesAvailable) {
+        await message("Automatic updates are not available for this fork yet. Run npm run install:mac from the desktop folder in your babgev/nurb checkout. It replaces Nurb Fork and keeps projects, settings, and conversations.", { title: "Nurb Fork" });
+        return;
+      }
       // The dev build never checks, so saying "newest version" would be a lie.
       if (!import.meta.env.PROD) return;
       try {
@@ -590,9 +606,7 @@ function App() {
   useEffect(() => {
     setResumeState(null);
     setVariantOrigin(null);   // the pin belongs to the viewer this project just left
-    // Leaving a project keeps busy columns and hidden results. Ordinary idle
-    // columns go now; an unseen one goes after its exact chat has been shown.
-    setColumns((list) => retainChatColumns(list, active, busyRef.current));
+    // Open tabs stay mounted across project switches, including idle drafts.
     setPartNaming(false);
     setProjectChatFocused(false);
     setProjectSeed(null);
@@ -658,6 +672,7 @@ function App() {
     // Removed projects lose their columns even mid-turn; there is no rail row
     // left to ever show the result.
     setColumns((list) => list.filter((col) => col.path !== path));
+    setClosedTabs((list) => list.filter((col) => col.path !== path));
     await invoke("remove_project", { path });
     setServers((s) => {
       const { [path]: _, ...rest } = s;
@@ -746,16 +761,13 @@ function App() {
         ? PROJECT_CHAT
         : selectedPart
       : null;
-  const visibleChatKey = active && visiblePart ? chatKey(active, visiblePart) : null;
-  const columnVisible = (col: ChatColumn) =>
-    visibleChatKey === chatKey(col.path, col.part);
+  const visibleColumn = active && visiblePart ? selectedChat(columns, selectedTabs, active, visiblePart) : undefined;
+  const visibleColumnId = visibleColumn?.id;
+  const columnVisible = (col: ChatColumn) => col.id === visibleColumnId;
 
-  // A hidden result has now actually painted. It can return to the ordinary
-  // idle-column lifecycle and be torn down the next time its project is left.
   useEffect(() => {
-    if (!active || !visiblePart) return;
-    setColumns((list) => markChatSeen(list, active, visiblePart));
-  }, [active, visiblePart]);
+    if (visibleColumnId) setColumns((list) => markChatSeen(list, visibleColumnId));
+  }, [visibleColumnId]);
 
   // Opening a chat column waits for the project's session list, then seeds
   // the column with the conversation to resume. A column that survived a
@@ -770,17 +782,17 @@ function App() {
           : [
               ...list,
               {
+                id: crypto.randomUUID(),
                 path: active,
                 part,
-                agent: seed?.agent ?? null,
+                agent: seed?.agent ?? defaultAgent,
                 resume: seed?.id ?? null,
-                gen: 0,
                 unseen: false,
               },
             ],
       );
     },
-    [active, resumeState],
+    [active, resumeState, defaultAgent],
   );
 
   // Selecting a part opens (and keeps open) its chat column.
@@ -857,73 +869,67 @@ function App() {
     if (name) createPart(name);
   };
 
-  // Bump the part's generation to remount its column without a session to
-  // resume. With no agent named ("start fresh") the agent resets too, so the
-  // new conversation takes the current default; naming one pins it, which is
-  // how the chat header switches agents. Either way the old conversation stays
-  // in its agent's own store.
-  const startFresh = async (path: string, part: string, agent: string | null = null) => {
-    try {
-      // Persist the empty selection before remounting. Otherwise quitting
-      // before the first new prompt would restore the old newest session.
-      await invoke("select_part_chat", {
-        path,
-        part,
-        sessionId: null,
-      });
-    } catch (e) {
-      setError(String(e));
+  const startFresh = (path: string, part: string, agent = defaultAgent, draft?: ChatColumn["draft"], config?: ChatColumn["config"]): Promise<boolean> => {
+    const id = crypto.randomUUID();
+    setColumns((list) => [...list, { id, path, part, agent, resume: null, draft, config, unseen: false }]);
+    setSelectedTabs((map) => ({ ...map, [chatKey(path, part)]: id }));
+    return Promise.resolve(true);
+  };
+
+  const updateTab = (id: string, patch: Partial<ChatColumn>) => {
+    setColumns((list) => list.map((col) => {
+      if (col.id !== id) return col;
+      // Draft/config callbacks may fire after provider menus refresh unchanged.
+      return Object.entries(patch).every(([key, value]) => JSON.stringify(col[key as keyof ChatColumn]) === JSON.stringify(value)) ? col : { ...col, ...patch };
+    }));
+  };
+
+  const closeTab = (id: string) => {
+    if (busyRef.current[id]) {
+      setError("Stop the agent before closing this tab.");
       return;
     }
-    setColumns((list) =>
-      list.map((col) =>
-        col.path === path && col.part === part
-          ? { ...col, resume: null, agent, gen: col.gen + 1 }
-          : col,
-      ),
-    );
+    const next = closeChatTab({ columns, selected: selectedTabs }, id, crypto.randomUUID());
+    if (next.columns === columns) return;
+    const closing = columns.find((col) => col.id === id);
+    if (closing) setClosedTabs((list) => [...list.filter((col) => col.id !== id), closing]);
+    setColumns(next.columns);
+    setSelectedTabs(next.selected);
   };
 
-  // Track live session ids so switching parts and back resumes the same
-  // conversation even before the agent's store has it listed. Pinning the
-  // agent here is what keeps a conversation on the agent that started it
-  // when the default changes later.
-  const chatStarted = (path: string, part: string, id: string, agent: string) => {
-    // A session exists before its first prompt is stored by the adapter. Keep
-    // that id as the part's choice now, so a failed/abandoned first prompt does
-    // not resurrect the conversation that "start fresh" set aside.
-    invoke("select_part_chat", { path, part, sessionId: id }).catch((e) =>
-      setError(String(e)),
-    );
-    setColumns((list) =>
-      list.map((col) =>
-        col.path === path && col.part === part ? { ...col, resume: id, agent } : col,
-      ),
-    );
+  // The native accelerator also works while the CAD viewer iframe has focus.
+  // One native event path avoids closing two tabs from the same key press.
+  const closeActiveTab = useRef(() => {});
+  closeActiveTab.current = () => { if (visibleColumnId) closeTab(visibleColumnId); };
+  useEffect(() => {
+    const unlisten = listen("menu:close-tab", () => closeActiveTab.current());
+    return () => { unlisten.then((fn) => fn()); };
+  }, []);
+
+  const reopenTab = (id: string) => {
+    const tab = closedTabs.find((col) => col.id === id);
+    if (!tab) return;
+    setColumns((list) => list.some((col) => col.id === id) ? list : [...list, tab]);
+    setClosedTabs((list) => list.filter((col) => col.id !== id));
+    setSelectedTabs((map) => ({ ...map, [chatKey(tab.path, tab.part)]: id }));
   };
 
-  const chatBusy = (
-    path: string,
-    part: string,
-    agent: string,
-    busy: boolean,
-    visible: boolean,
-  ) => {
-    const key = chatKey(path, part);
-    const wasBusy = Boolean(busyRef.current[key]);
-    setBusyChats((map) => {
-      if (busy) return { ...map, [key]: true };
-      if (!(key in map)) return map;
-      const { [key]: _, ...rest } = map;
-      return rest;
-    });
-    // Pin a fresh column before adapter startup can overlap a default-agent
-    // change. Hidden completions remain mounted until the user sees them: an
-    // auth failure's restored draft and error have no session to reload.
-    setColumns((list) =>
-      updateChatActivity(list, path, part, agent, busy, visible, wasBusy),
-    );
+  const chatStarted = (col: ChatColumn, id: string, agent: string) => {
+    // Preserve the legacy selected session for older app versions as well.
+    if (col.id === visibleColumnId) invoke("select_part_chat", { path: col.path, part: col.part, sessionId: id }).catch((e) => setError(String(e)));
+    updateTab(col.id, { resume: id, agent });
   };
+
+  const chatBusy = (id: string, agent: string, busy: boolean, visible: boolean) => {
+    const wasBusy = Boolean(busyRef.current[id]);
+    const next = { ...busyRef.current };
+    if (busy) next[id] = true;
+    else delete next[id];
+    busyRef.current = next;
+    setBusyChats(next);
+    setColumns((list) => updateChatActivity(list, id, agent, busy, visible, wasBusy));
+  };
+  const scopeBusy = (path: string, part?: string) => columns.some((col) => col.path === path && (part === undefined || col.part === part) && busyChats[col.id]);
 
   // ?embed hides the viewer's own title and part list; the rail is the one
   // place parts live in the app. The src is pinned per project: WKWebView
@@ -1028,9 +1034,7 @@ function App() {
                   <span className="tag">starting…</span>
                 ) : null}
                 {project.path !== active &&
-                  Object.keys(busyChats).some((key) =>
-                    key.startsWith(chatKey(project.path, "")),
-                  ) && (
+                  scopeBusy(project.path) && (
                     // The dot the part rows wear, lifted to the project row:
                     // an agent is still working here in the background.
                     <span
@@ -1039,9 +1043,7 @@ function App() {
                     />
                   )}
                 {project.path !== active &&
-                  !Object.keys(busyChats).some((key) =>
-                    key.startsWith(chatKey(project.path, "")),
-                  ) &&
+                  !scopeBusy(project.path) &&
                   columns.some((col) => col.path === project.path && col.unseen) && (
                     <span
                       className="part-unseen"
@@ -1061,7 +1063,7 @@ function App() {
                   >
                     <IconCubes label="the whole project" />
                     <span className="part-name">project</span>
-                    {busyChats[chatKey(project.path, PROJECT_CHAT)] ? (
+                    {scopeBusy(project.path, PROJECT_CHAT) ? (
                       <span className="part-busy" title="the agent is working on the project" />
                     ) : columns.some(
                         (col) =>
@@ -1088,7 +1090,7 @@ function App() {
                       >
                         {part.assembly ? <IconCubes label={assemblyLabel(part)} /> : <IconCube />}
                         <span className="part-name">{part.name}</span>
-                        {busyChats[chatKey(project.path, part.name)] ? (
+                        {scopeBusy(project.path, part.name) ? (
                           <span className="part-busy" title="the agent is working on this part" />
                         ) : columns.some(
                             (col) =>
@@ -1220,7 +1222,7 @@ function App() {
           <div className="rail-foot-row">
             {about && (
               <button className="rail-version" onClick={() => setShowAbout(true)}>
-                nurb {about.appVersion}
+                {FORK_LABEL} · {about.appVersion}
               </button>
             )}
             <button
@@ -1328,16 +1330,13 @@ function App() {
           }}
         />
       )}
-      {/* One column per opened chat, all mounted so background turns keep
-          streaming; only the active project's focused chat is visible. Keyed
-          by project, part, and generation: starting fresh remounts a column
-          (and its adapter); switching parts or projects does not. */}
-      {columns.map((col) => {
+      {/* Each tab owns its mounted chat; navigation never interrupts its agent. */}
+      {ready === true && columns.map((col) => {
         const agent = col.agent ?? defaultAgent;
         const isProject = col.part === PROJECT_CHAT;
         return (
           <Chat
-            key={`${col.path}:${col.part}:${col.gen}:${agent}`}
+            key={col.id}
             path={col.path}
             part={col.part}
             agent={agent}
@@ -1350,21 +1349,32 @@ function App() {
                 label: AGENT_LABEL[status.id] ?? status.label,
                 loggedIn: status.loggedIn,
               }))}
+            tabBar={<ConversationTabs
+              tabs={columns.filter((tab) => tab.path === col.path && tab.part === col.part)}
+              selected={col.id}
+              busy={busyChats}
+              closed={closedTabs.filter((tab) => tab.path === col.path && tab.part === col.part)}
+              onReopen={reopenTab}
+              onSelect={(id) => setSelectedTabs((map) => ({ ...map, [chatKey(col.path, col.part)]: id }))}
+              onClose={closeTab}
+              onNew={() => { void startFresh(col.path, col.part, agent, undefined, col.config); }}
+            />}
+            initialConfig={col.config}
+            onConfig={(config) => updateTab(col.id, { config })}
+            onModel={(model) => updateTab(col.id, { model })}
+            onDraft={(draft) => updateTab(col.id, { draft })}
+            draft={col.draft}
             resume={col.resume}
             hidden={!columnVisible(col)}
             seed={isProject && col.path === active ? projectSeed : null}
             onSeed={isProject ? () => setProjectSeed(null) : undefined}
-            onSession={(id) => chatStarted(col.path, col.part, id, agent)}
-            onFresh={() => startFresh(col.path, col.part)}
-            onAgent={(id, unstarted) => {
-              // Picking an agent before the first message is choosing which
-              // agent you work with, so it sticks for later chats too.
-              if (unstarted) chooseAgent(id);
-              startFresh(col.path, col.part, id);
+            onSession={(id) => chatStarted(col, id, agent)}
+            onFresh={() => { void startFresh(col.path, col.part, agent, undefined, col.config); }}
+            onAgent={async (id, _unstarted, draft, model) => {
+              chooseAgent(id);
+              return startFresh(col.path, col.part, id, draft, { model });
             }}
-            onBusy={(busy) =>
-              chatBusy(col.path, col.part, agent, busy, columnVisible(col))
-            }
+            onBusy={(busy) => chatBusy(col.id, agent, busy, columnVisible(col))}
             onSignIn={signInAgent}
           />
         );

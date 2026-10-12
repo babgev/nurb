@@ -27,6 +27,8 @@ concurrency:
 
 jobs:
   publish:
+    # The fork must not publish to the upstream PyPI project.
+    if: github.repository == 'Shpigford/nurb'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

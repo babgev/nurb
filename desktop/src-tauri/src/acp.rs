@@ -19,7 +19,7 @@ use agent_client_protocol::schema::v1::{
     ListSessionsRequest, LoadSessionRequest, Meta, NewSessionRequest, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigSelectOptions,
-    SessionId, SessionNotification, SetSessionConfigOptionRequest, TextContent,
+    SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, TextContent,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
@@ -94,6 +94,7 @@ type Pending = Arc<Mutex<HashMap<u32, oneshot::Sender<RequestPermissionOutcome>>
 
 pub struct Chats {
     sessions: Mutex<HashMap<String, ChatSession>>,
+    starting: Mutex<HashMap<String, oneshot::Sender<()>>>,
 }
 
 struct ChatSession {
@@ -105,7 +106,7 @@ struct ChatSession {
     channel: Channel<ChatEvent>,
     /// The model and effort this session is actually running on, as the agent
     /// last reported them.
-    config: Mutex<Vec<ConfigRow>>,
+    config: Arc<Mutex<Vec<ConfigRow>>>,
     /// Per-model effort menus from Grok's initialize `_meta.modelState`. Empty
     /// for agents that speak ACP config options. Needed because switching Grok's
     /// model rebuilds the effort list, and `session/set_model` does not return
@@ -121,6 +122,7 @@ impl Chats {
     pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            starting: Mutex::new(HashMap::new()),
         }
     }
 
@@ -143,6 +145,7 @@ pub async fn start_chat(
     agent: String,
     on_event: Channel<ChatEvent>,
     resume: Option<String>,
+    startup_id: Option<String>,
 ) -> Result<String, String> {
     let kind = AgentKind::parse(&agent)?;
     let project = PathBuf::from(&path);
@@ -152,6 +155,11 @@ pub async fn start_chat(
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
     let (ready_tx, ready_rx) = oneshot::channel();
     let (close_tx, close_rx) = oneshot::channel();
+    let (startup_tx, startup_rx) = oneshot::channel();
+    if let Some(id) = &startup_id {
+        use tauri::Manager;
+        app.state::<Chats>().starting.lock().unwrap().insert(id.clone(), startup_tx);
+    }
     tauri::async_runtime::spawn(run_chat(
         app.clone(),
         project.clone(),
@@ -162,9 +170,14 @@ pub async fn start_chat(
         ready_tx,
         close_tx,
         close_rx,
+        startup_rx,
     ));
-    ready_rx
-        .await
+    let ready = ready_rx.await;
+    if let Some(id) = startup_id {
+        use tauri::Manager;
+        app.state::<Chats>().starting.lock().unwrap().remove(&id);
+    }
+    ready
         .map_err(|_| format!("{} exited before it was ready", kind.label()))?
         .map_err(|error| friendly(kind, error))
 }
@@ -204,7 +217,7 @@ pub async fn list_sessions(
             (
                 kind,
                 tauri::async_runtime::spawn(async move {
-                    agent_sessions(&launcher, kind, project).await
+                    agent_sessions(&launcher, kind, project, false).await
                 }),
             )
         })
@@ -267,6 +280,7 @@ async fn agent_sessions(
     launcher: &crate::env::Launcher,
     kind: AgentKind,
     project: PathBuf,
+    models_only: bool,
 ) -> Result<
     (
         Vec<agent_client_protocol::schema::v1::SessionInfo>,
@@ -316,7 +330,7 @@ async fn agent_sessions(
                     // asking here is what lets the very first chat of a fresh
                     // install open with a working picker. Failure (a signed-out
                     // Codex answers -32000) just means no picker.
-                    let config = cx
+                    let discovered = cx
                         .send_request(NewSessionRequest::new(project.clone()))
                         .block_task()
                         .await
@@ -326,9 +340,13 @@ async fn agent_sessions(
                                 session.meta.as_ref(),
                                 init.meta.as_ref(),
                             )
-                        })
-                        .unwrap_or_else(|_| grok_rows(None, init.meta.as_ref()));
-                    if init.agent_capabilities.session_capabilities.list.is_none() {
+                        });
+                    let config = match discovered {
+                        Ok(config) => config,
+                        Err(error) if models_only && menus.is_empty() => return Err(error),
+                        Err(_) => grok_rows(None, init.meta.as_ref()),
+                    };
+                    if models_only || init.agent_capabilities.session_capabilities.list.is_none() {
                         return Ok((Vec::new(), config, model_rows));
                     }
                     let mut sessions = Vec::new();
@@ -350,7 +368,14 @@ async fn agent_sessions(
     .await;
     reap(pgid, child).await;
     listed
-        .map_err(|_| "timed out listing conversations".to_string())?
+        .map_err(|_| {
+            if models_only {
+                "Timed out loading models. Try refreshing this provider."
+            } else {
+                "timed out listing conversations"
+            }
+            .to_string()
+        })?
         .map_err(|error| friendly(kind, error))
 }
 
@@ -993,6 +1018,19 @@ fn rows(options: &[SessionConfigOption]) -> Vec<ConfigRow> {
         .collect()
 }
 
+fn update_config(
+    current: &Mutex<Vec<ConfigRow>>,
+    update: &SessionUpdate,
+) -> Option<Vec<ConfigRow>> {
+    let SessionUpdate::ConfigOptionUpdate(update) = update else {
+        return None;
+    };
+    // ACP sends the complete set, including removal of options.
+    let updated = rows(&update.config_options);
+    *current.lock().unwrap() = updated.clone();
+    Some(updated)
+}
+
 /// Put the user's remembered picks onto a session the moment it exists, before
 /// the first prompt can go out on the wrong model. A pick the agent no longer
 /// offers (a model dropped from an account's allowlist) is skipped, leaving the
@@ -1056,6 +1094,27 @@ async fn apply_choices(
     current
 }
 
+/// Refresh one provider independently without sending a prompt or listing history.
+#[tauri::command]
+pub async fn refresh_chat_config(
+    app: tauri::AppHandle,
+    path: String,
+    agent: String,
+) -> Result<Vec<ConfigRow>, String> {
+    use tauri::{Emitter, Manager};
+    let kind = AgentKind::parse(&agent)?;
+    let launcher = app.state::<crate::env::Launcher>().inner().clone();
+    let (_, config, model_rows) =
+        agent_sessions(&launcher, kind, PathBuf::from(path), true).await?;
+    let prefs = app.state::<PrefStore>();
+    prefs.replace_cache(kind.id(), config);
+    if kind == AgentKind::Grok {
+        prefs.cache_model_rows(kind.id(), model_rows);
+    }
+    let _ = app.emit("agent-config", ());
+    Ok(prefs.rows(kind.id()))
+}
+
 /// What the picker draws. A part's chat has no adapter until its first message,
 /// so with no session running this answers from the remembered lists.
 #[tauri::command]
@@ -1070,6 +1129,9 @@ pub fn chat_config(
         let sessions = app.state::<Chats>();
         let sessions = sessions.sessions.lock().unwrap();
         if let Some(chat) = sessions.get(&id) {
+            if chat.agent != kind {
+                return Err("chat belongs to another agent".into());
+            }
             return Ok(chat.config.lock().unwrap().clone());
         }
     }
@@ -1077,8 +1139,8 @@ pub fn chat_config(
 }
 
 /// Remember a pick and, when a session is running, move it there now. The
-/// choice is stored either way, so it still lands on the next session if this
-/// chat has not started one yet. Addressed by category, since that is the key
+/// choice is stored after the live agent accepts it, or validated against the
+/// cached menu if this chat has not started yet. Addressed by category, since that is the key
 /// the picker and the store share; the agent's own option id comes from the
 /// live session's list.
 #[tauri::command]
@@ -1091,18 +1153,24 @@ pub async fn set_chat_config(
 ) -> Result<Vec<ConfigRow>, String> {
     use tauri::Manager;
     let kind = AgentKind::parse(&agent)?;
-    app.state::<PrefStore>()
-        .remember(kind.id(), &category, &value);
-    let live = session_id.and_then(|id| {
-        let sessions = app.state::<Chats>();
-        let sessions = sessions.sessions.lock().unwrap();
-        sessions.get(&id).and_then(|chat| {
+    let live = session_id
+        .map(|id| {
+            let sessions = app.state::<Chats>();
+            let sessions = sessions.sessions.lock().unwrap();
+            let chat = sessions.get(&id).ok_or("chat is not running")?;
+            if chat.agent != kind {
+                return Err("chat belongs to another agent");
+            }
             let current = chat.config.lock().unwrap().clone();
             let config_id = current
                 .iter()
-                .find(|row| row.category == category)
-                .map(|row| row.id.clone())?;
-            Some((
+                .find(|row| {
+                    row.category == category
+                        && row.options.iter().any(|choice| choice.value == value)
+                })
+                .map(|row| row.id.clone())
+                .ok_or("This choice is no longer available. Choose another model or effort.")?;
+            Ok((
                 id.clone(),
                 chat.conn.clone(),
                 chat.session.clone(),
@@ -1112,9 +1180,19 @@ pub async fn set_chat_config(
                 config_id,
             ))
         })
-    });
+        .transpose()?;
     let Some((id, conn, session, agent_kind, menus, current, config_id)) = live else {
-        return Ok(app.state::<PrefStore>().rows(kind.id()));
+        let prefs = app.state::<PrefStore>();
+        let available = prefs.rows(kind.id()).iter().any(|row| {
+            row.category == category && row.options.iter().any(|choice| choice.value == value)
+        });
+        if !available {
+            return Err(
+                "This choice is no longer available. Choose another model or effort.".into(),
+            );
+        }
+        prefs.remember(kind.id(), &category, &value);
+        return Ok(prefs.rows(kind.id()));
     };
     let updated = if agent_kind == AgentKind::Grok {
         set_grok_choice(&conn, &session, &category, &value, &current, &menus)
@@ -1132,13 +1210,26 @@ pub async fn set_chat_config(
             .map_err(|error| friendly(kind, error))?;
         rows(&response.config_options)
     };
-    app.state::<PrefStore>().cache(kind.id(), updated.clone());
+    app.state::<PrefStore>()
+        .replace_cache(kind.id(), updated.clone());
+    if let Some(row) = updated.iter().find(|row| row.category == category) {
+        app.state::<PrefStore>()
+            .remember(kind.id(), &category, &row.value);
+    }
     let sessions = app.state::<Chats>();
     let sessions = sessions.sessions.lock().unwrap();
     if let Some(chat) = sessions.get(&id) {
         *chat.config.lock().unwrap() = updated.clone();
     }
     Ok(updated)
+}
+
+#[tauri::command]
+pub fn cancel_chat_start(app: tauri::AppHandle, startup_id: String) {
+    use tauri::Manager;
+    if let Some(cancel) = app.state::<Chats>().starting.lock().unwrap().remove(&startup_id) {
+        let _ = cancel.send(());
+    }
 }
 
 #[tauri::command]
@@ -1167,6 +1258,7 @@ async fn run_chat(
     ready_tx: oneshot::Sender<Ready>,
     close_tx: oneshot::Sender<()>,
     close_rx: oneshot::Receiver<()>,
+    startup_rx: oneshot::Receiver<()>,
 ) {
     use tauri::Manager;
     let launcher = app.state::<crate::env::Launcher>();
@@ -1181,6 +1273,7 @@ async fn run_chat(
             config = config.env("GEMINI_API_KEY", key);
         }
     }
+    let _ = channel.send(ChatEvent::Activity { phase: format!("Launching {}", kind.label()) });
     let agent = AcpAgent::new(config);
     let (stdin, stdout, stderr, child) = match agent.spawn_process() {
         Ok(spawned) => spawned,
@@ -1199,10 +1292,16 @@ async fn run_chat(
     let replaying = Arc::new(AtomicBool::new(false));
     let notify_replaying = Arc::clone(&replaying);
     let notify_channel = channel.clone();
+    let notify_app = app.clone();
     let ask_channel = channel.clone();
     let ask_pending = pending.clone();
     let live_session = Arc::new(Mutex::new(None));
     let connected_session = Arc::clone(&live_session);
+    let notify_session = Arc::clone(&live_session);
+    // Shared before session/new so config notifications during startup are
+    // consumed too. Session responses supply the snapshot at each response.
+    let session_config = Arc::new(Mutex::new(Vec::new()));
+    let notify_config = Arc::clone(&session_config);
     let chat_app = app.clone();
     let chat_project = project.clone();
     let chat_pending = pending.clone();
@@ -1210,10 +1309,19 @@ async fn run_chat(
     let mut ready_tx = Some(ready_tx);
     let mut close_tx = Some(close_tx);
 
-    let result = Client
+    let connection = Client
         .builder()
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
+                let matches = notify_session.lock().unwrap().as_ref()
+                    .is_none_or(|id| *id == wire_string(&notification.session_id));
+                if !matches { return Ok(()); }
+                let updated = matches.then(|| update_config(&notify_config, &notification.update)).flatten();
+                if let Some(updated) = updated {
+                    use tauri::Emitter;
+                    notify_app.state::<PrefStore>().replace_cache(kind.id(), updated);
+                    let _ = notify_app.emit("agent-config", ());
+                }
                 forward(
                     &notify_channel,
                     notification.update,
@@ -1293,6 +1401,7 @@ async fn run_chat(
                 let chat_channel = chat_channel.clone();
                 async move {
                     let session = async {
+                        let _ = chat_channel.send(ChatEvent::Activity { phase: format!("Connecting to {}", kind.label()) });
                         let init = cx
                             .send_request(InitializeRequest::new(ProtocolVersion::V1))
                             .block_task()
@@ -1311,6 +1420,7 @@ async fn run_chat(
                             // the user an empty conversation.
                             let restored = if init.agent_capabilities.load_session {
                                 let requested = SessionId::new(id.clone());
+                                let _ = chat_channel.send(ChatEvent::Activity { phase: "Loading conversation history".into() });
                                 load_replaying.store(true, Ordering::Relaxed);
                                 let mut request =
                                     LoadSessionRequest::new(requested.clone(), project.clone());
@@ -1355,6 +1465,7 @@ async fn run_chat(
                                 }
                             }
                         }
+                        let _ = chat_channel.send(ChatEvent::Activity { phase: "Opening conversation".into() });
                         let mut request = NewSessionRequest::new(project);
                         if let Some(meta) = open_meta {
                             request = request.meta(meta);
@@ -1381,6 +1492,7 @@ async fn run_chat(
                             // Before ready_tx: the picker's choice has to be on
                             // the session by the time the first prompt can go
                             // out, or the opening turn runs on the wrong model.
+                            let _ = chat_channel.send(ChatEvent::Activity { phase: "Applying model settings".into() });
                             let config = apply_choices(
                                 &cx,
                                 &session,
@@ -1391,12 +1503,13 @@ async fn run_chat(
                             )
                             .await;
                             let prefs = chat_app.state::<PrefStore>();
-                            prefs.cache(kind.id(), config.clone());
+                            prefs.replace_cache(kind.id(), config.clone());
                             if kind == AgentKind::Grok {
                                 prefs.cache_model_rows(kind.id(), grok_rows_by_model(&menus));
                             }
                             let id = wire_string(&session);
                             *connected_session.lock().unwrap() = Some(id.clone());
+                            *session_config.lock().unwrap() = config;
                             chat_app.state::<Chats>().sessions.lock().unwrap().insert(
                                 id.clone(),
                                 ChatSession {
@@ -1406,7 +1519,7 @@ async fn run_chat(
                                     agent: kind,
                                     pending: chat_pending,
                                     channel: chat_channel,
-                                    config: Mutex::new(config),
+                                    config: session_config,
                                     grok_models: menus,
                                     pgid,
                                     _close: close_tx,
@@ -1436,8 +1549,11 @@ async fn run_chat(
                     }
                 }
             },
-        )
-        .await;
+        );
+    let (was_cancelled, result) = tokio::select! {
+        result = connection => (false, result),
+        _ = startup_cancelled(startup_rx) => (true, Ok(live_session.lock().unwrap().clone())),
+    };
 
     // Whichever way the connection ended, take the process tree with it.
     reap(pgid, child).await;
@@ -1456,6 +1572,7 @@ async fn run_chat(
             .lock()
             .unwrap()
             .remove(&session_id);
+        if was_cancelled { return; }
         let error = ChatEvent::SessionError {
             message: format!(
                 "{} stopped unexpectedly. Send a message to start a fresh chat.",
@@ -1464,6 +1581,13 @@ async fn run_chat(
         };
         events::mirror(&error);
         let _ = channel.send(error);
+    }
+}
+
+async fn startup_cancelled(receiver: oneshot::Receiver<()>) {
+    if receiver.await.is_err() {
+        // Dropping a completed startup token is not a cancellation.
+        std::future::pending::<()>().await;
     }
 }
 
@@ -1532,6 +1656,19 @@ fn friendly(kind: AgentKind, error: agent_client_protocol::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn startup_cancellation_is_explicit_and_completed_tokens_do_not_kill_sessions() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            sender.send(()).unwrap();
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(20), super::startup_cancelled(receiver)).await.is_ok());
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            drop(sender);
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(20), super::startup_cancelled(receiver)).await.is_err());
+        });
+    }
+
     use super::{
         attachment_block, friendly, grok_open_meta, grok_rows, picker_rows, rows, with_grok_choice,
         AgentKind,
@@ -1619,6 +1756,81 @@ mod tests {
     #[test]
     fn an_agent_that_offers_no_config_yields_no_picker() {
         assert!(rows(&[]).is_empty());
+    }
+
+    #[test]
+    fn provider_versions_descriptions_and_alias_ids_reach_the_picker_unchanged() {
+        let options: Vec<SessionConfigOption> = serde_json::from_value(serde_json::json!([{
+            "id": "model", "name": "Model", "category": "model", "type": "select",
+            "currentValue": "default",
+            "options": [
+                {"value": "default", "name": "Default (recommended)", "description": "Opus"},
+                {"value": "opus", "name": "Opus 5.5", "description": "Opus 5.5 with 1M context"},
+                {"value": "fable", "name": "Fable 5.1"},
+                {"value": "sonnet", "name": "Sonnet 5.5"},
+                {"value": "haiku", "name": "Haiku 5.5"}
+            ]
+        }]))
+        .unwrap();
+        let config = rows(&options);
+        let model = &config[0];
+        assert_eq!(model.value, "default");
+        assert_eq!(
+            model
+                .options
+                .iter()
+                .map(|choice| choice.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Default (recommended)",
+                "Opus 5.5",
+                "Fable 5.1",
+                "Sonnet 5.5",
+                "Haiku 5.5"
+            ]
+        );
+        assert_eq!(model.options[0].description.as_deref(), Some("Opus"));
+        assert_eq!(model.options[1].value, "opus");
+        assert_eq!(
+            model.options[1].description.as_deref(),
+            Some("Opus 5.5 with 1M context")
+        );
+    }
+
+    #[test]
+    fn live_config_notifications_replace_the_complete_menu() {
+        use agent_client_protocol::schema::v1::SessionNotification;
+        use std::sync::Mutex;
+
+        let current = Mutex::new(rows(
+            &serde_json::from_str::<Vec<SessionConfigOption>>(CLAUDE).unwrap(),
+        ));
+        let notification: SessionNotification = serde_json::from_value(serde_json::json!({
+            "sessionId": "live-session",
+            "update": {
+                "sessionUpdate": "config_option_update",
+                "configOptions": [{
+                    "id": "model", "name": "Model", "category": "model", "type": "select",
+                    "currentValue": "newly-released-model",
+                    "options": [{"value": "newly-released-model", "name": "New model"}]
+                }]
+            }
+        }))
+        .unwrap();
+        let updated = super::update_config(&current, &notification.update).unwrap();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(current.lock().unwrap()[0].value, "newly-released-model");
+        assert_eq!(current.lock().unwrap()[0].options[0].name, "New model");
+
+        let empty: SessionNotification = serde_json::from_value(serde_json::json!({
+            "sessionId": "live-session",
+            "update": {"sessionUpdate": "config_option_update", "configOptions": []}
+        }))
+        .unwrap();
+        assert!(super::update_config(&current, &empty.update)
+            .unwrap()
+            .is_empty());
+        assert!(current.lock().unwrap().is_empty());
     }
 
     /// Grok 1.0.5's session/new, captured off the wire: no `configOptions`,
