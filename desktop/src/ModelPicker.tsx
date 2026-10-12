@@ -69,13 +69,17 @@ export default function ModelPicker({
     ...provider,
     config: provider.id === agent ? config : provider.config,
   }));
-  const models = catalogs.flatMap((provider) => {
+  const modelGroups = catalogs.map((provider) => {
     const row = provider.config.find((option) => option.category === "model");
     const effortName = selectedName(provider.config.find((option) => option.category === "thought_level"));
-    return (row?.options ?? []).map((model) => ({ provider, model, effortName }));
-  }).filter(({ provider, model }) =>
-    `${provider.label} ${model.name} ${model.value} ${model.description ?? ""}`.toLowerCase().includes(normalizedQuery),
-  );
+    return (row?.options ?? [])
+      .filter((model) => `${provider.label} ${model.name} ${model.value} ${model.description ?? ""}`.toLowerCase().includes(normalizedQuery))
+      .map((model) => ({ provider, model, effortName }));
+  });
+  // A large catalog must not push every other provider below the fold.
+  const models = Array.from({ length: Math.max(0, ...modelGroups.map((group) => group.length)) }, (_, index) =>
+    modelGroups.flatMap((group) => group[index] ? [group[index]] : []),
+  ).flat();
   const statuses = catalogs.filter((provider) =>
     (provider.loading || provider.error || provider.loggedIn === false ||
       !provider.config.some((row) => row.category === "model" && row.options.length > 0)) &&
@@ -97,7 +101,7 @@ export default function ModelPicker({
         width,
         left: Math.max(12, Math.min(rect.left, window.innerWidth - width - 12)),
         bottom: window.innerHeight - rect.top + 8,
-        maxHeight: Math.max(100, rect.top - 20),
+        maxHeight: Math.min(560, Math.max(100, rect.top - 20)),
       });
     }
     place();
