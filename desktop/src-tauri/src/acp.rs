@@ -4,7 +4,7 @@
 
 mod events;
 mod policy;
-mod sandbox;
+pub(crate) mod sandbox;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -1258,10 +1258,23 @@ async fn run_chat(
     ready_tx: oneshot::Sender<Ready>,
     close_tx: oneshot::Sender<()>,
     close_rx: oneshot::Receiver<()>,
-    startup_rx: oneshot::Receiver<()>,
+    mut startup_rx: oneshot::Receiver<()>,
 ) {
     use tauri::Manager;
     let launcher = app.state::<crate::env::Launcher>();
+    let mut mcp_snapshot = match app.state::<crate::mcp::McpStore>().snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(message) => { let _ = ready_tx.send(Err(agent_client_protocol::Error::new(-32603, message))); return; }
+    };
+    let browser_setup = crate::mcp::prepare_presets(&mut mcp_snapshot.1, &launcher);
+    let _mcp_browsers = tokio::select! {
+        result = browser_setup => match result {
+            Ok(browsers) => browsers,
+            Err(message) => { let _ = ready_tx.send(Err(agent_client_protocol::Error::new(-32603, message))); return; }
+        },
+        _ = &mut startup_rx => return,
+    };
+    let mcp_path = launcher.adapter_path().unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
     let (program, args) = launcher.adapter(kind);
     let (program, args) = sandbox::wrap(program, args, &project, &launcher.engine_root());
     let mut config = AcpAgentConfig::new(program).args(args);
@@ -1399,6 +1412,10 @@ async fn run_chat(
                 let chat_project = chat_project.clone();
                 let chat_pending = chat_pending.clone();
                 let chat_channel = chat_channel.clone();
+                let mcp_snapshot = mcp_snapshot.clone();
+                let mcp_path = mcp_path.clone();
+                let mcp_attached = Arc::new(Mutex::new((Vec::new(), Vec::new())));
+                let session_mcp = Arc::clone(&mcp_attached);
                 async move {
                     let session = async {
                         let _ = chat_channel.send(ChatEvent::Activity { phase: format!("Connecting to {}", kind.label()) });
@@ -1406,6 +1423,9 @@ async fn run_chat(
                             .send_request(InitializeRequest::new(ProtocolVersion::V1))
                             .block_task()
                             .await?;
+                        let (mcp_servers, attached, unsupported) = crate::mcp::agent_servers(&mcp_snapshot.1, &init.agent_capabilities.mcp_capabilities, &mcp_path);
+                        if !unsupported.is_empty() { let _ = chat_channel.send(ChatEvent::Note { text: "Some MCP servers could not be attached. Open MCPs to check transport support and executable paths.".into() }); }
+                        *mcp_attached.lock().unwrap() = (attached, unsupported);
                         let menus = grok_model_menus(init.meta.as_ref()).unwrap_or_default();
                         let chosen = chat_app.state::<PrefStore>().chosen(kind.id());
                         let open_meta = grok_open_meta(kind, &chosen);
@@ -1423,7 +1443,7 @@ async fn run_chat(
                                 let _ = chat_channel.send(ChatEvent::Activity { phase: "Loading conversation history".into() });
                                 load_replaying.store(true, Ordering::Relaxed);
                                 let mut request =
-                                    LoadSessionRequest::new(requested.clone(), project.clone());
+                                    LoadSessionRequest::new(requested.clone(), project.clone()).mcp_servers(mcp_servers.clone());
                                 if let Some(meta) = open_meta.clone() {
                                     request = request.meta(meta);
                                 }
@@ -1466,7 +1486,7 @@ async fn run_chat(
                             }
                         }
                         let _ = chat_channel.send(ChatEvent::Activity { phase: "Opening conversation".into() });
-                        let mut request = NewSessionRequest::new(project);
+                        let mut request = NewSessionRequest::new(project).mcp_servers(mcp_servers);
                         if let Some(meta) = open_meta {
                             request = request.meta(meta);
                         }
@@ -1508,6 +1528,8 @@ async fn run_chat(
                                 prefs.cache_model_rows(kind.id(), grok_rows_by_model(&menus));
                             }
                             let id = wire_string(&session);
+                            let (attached, unsupported) = session_mcp.lock().unwrap().clone();
+                            chat_app.state::<crate::mcp::McpStore>().record_session(&id, mcp_snapshot.0, attached, unsupported);
                             *connected_session.lock().unwrap() = Some(id.clone());
                             *session_config.lock().unwrap() = config;
                             chat_app.state::<Chats>().sessions.lock().unwrap().insert(
@@ -1566,6 +1588,7 @@ async fn run_chat(
         );
     }
     let live_session = live_session.lock().unwrap().clone();
+    if let Some(id) = &live_session { app.state::<crate::mcp::McpStore>().forget_session(id); }
     if let Some(session_id) = session_to_remove(&result, &live_session) {
         app.state::<Chats>()
             .sessions

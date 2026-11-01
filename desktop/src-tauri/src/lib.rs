@@ -1,5 +1,7 @@
 mod acp;
 mod agents;
+mod mcp;
+mod mcp_browser;
 mod env;
 mod prefs;
 mod provision;
@@ -566,12 +568,21 @@ pub fn run() {
             app.manage(Registry::load(&dir));
             app.manage(sessions::SessionStore::load(&dir));
             app.manage(prefs::PrefStore::load(&dir));
+            app.manage(mcp::McpStore::load(&dir));
             install_menu(app.handle())?;
             #[cfg(debug_assertions)]
             test_hook(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            mcp::list_mcp_servers,
+            mcp::get_mcp_server,
+            mcp::save_mcp_server,
+            mcp::set_mcp_enabled,
+            mcp::remove_mcp_server,
+            mcp::check_mcp_server,
+            mcp::mcp_session_status,
+            mcp::mcp_browser_preset,
             list_projects,
             default_projects_folder,
             create_project,

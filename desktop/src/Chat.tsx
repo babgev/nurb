@@ -19,6 +19,7 @@ import { AttachmentDraft, restoreDraftText } from "./chatDraft";
 import { activityStatus, elapsedLabel, mergeTool, type ToolItem } from "./chatActivity";
 import "./ChatActivity.css";
 import ModelPicker, { type ConfigRow } from "./ModelPicker";
+import McpPanel from "./McpPanel";
 
 // The whole-project conversation rides the per-part plumbing under a name no part
 // file can have. Twins live in App.tsx's mount and acp.rs's context line.
@@ -1079,6 +1080,7 @@ function Chat({
               void discoverModels();
             }}
           />
+          <McpPanel path={path} sessionId={sessionRef.current} hidden={hidden} />
           {busy || starting ? (
             <button type="button" className="chat-send chat-stop" onClick={cancel} disabled={cancelledAt !== null}>
               {cancelledAt !== null ? "stopping…" : "stop"}
