@@ -127,12 +127,8 @@ fn endpoint(contents: &str) -> Option<String> {
     Some(format!("ws://127.0.0.1:{port}{path}"))
 }
 
-pub async fn launch(root: &Path) -> Result<BrowserSession, String> {
-    let executable = chrome()?;
-    let profile = create_profile(root)?;
-    let mut command = Command::new(executable);
-    command.args([
-        "--headless=new",
+fn launch_args(visible: bool) -> Vec<&'static str> {
+    let mut args = vec![
         "--remote-debugging-address=127.0.0.1",
         "--remote-debugging-port=0",
         "--no-first-run",
@@ -144,8 +140,20 @@ pub async fn launch(root: &Path) -> Result<BrowserSession, String> {
         "--disable-breakpad",
         "--password-store=basic",
         "--use-mock-keychain",
-        "--no-startup-window",
-    ]);
+    ];
+    if visible {
+        args.push("about:blank");
+    } else {
+        args.extend(["--headless=new", "--no-startup-window"]);
+    }
+    args
+}
+
+pub async fn launch(root: &Path, visible: bool) -> Result<BrowserSession, String> {
+    let executable = chrome()?;
+    let profile = create_profile(root)?;
+    let mut command = Command::new(executable);
+    command.args(launch_args(visible));
     command.arg(format!("--user-data-dir={}", profile.display()));
     command.arg(format!(
         "--crash-dumps-dir={}",
@@ -206,6 +214,21 @@ pub async fn launch(root: &Path) -> Result<BrowserSession, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visible_mode_opens_a_page_without_changing_browser_sandboxing() {
+        let hidden = launch_args(false);
+        let visible = launch_args(true);
+        assert!(hidden.contains(&"--headless=new"));
+        assert!(hidden.contains(&"--no-startup-window"));
+        assert!(!visible.iter().any(|arg| arg.starts_with("--headless")));
+        assert!(!visible.contains(&"--no-startup-window"));
+        assert!(visible.contains(&"about:blank"));
+        for args in [hidden, visible] {
+            assert!(args.contains(&"--remote-debugging-address=127.0.0.1"));
+            assert!(!args.contains(&"--no-sandbox"));
+        }
+    }
 
     #[test]
     fn readiness_accepts_only_a_local_browser_endpoint() {
@@ -312,11 +335,52 @@ mod tests {
     #[ignore = "requires a local Google Chrome installation"]
     async fn real_chrome_starts_isolated_and_is_removed_on_close() {
         let root = std::env::temp_dir().join(format!("nurb-browser-live-{}", std::process::id()));
-        let browser = launch(&root).await.unwrap();
+        let browser = launch(&root, false).await.unwrap();
         assert!(browser.endpoint().starts_with("ws://127.0.0.1:"));
         let profile = browser.profile.clone();
         let output = browser.output_dir();
         assert!(!output.starts_with(&profile));
+        drop(browser);
+        for _ in 0..100 {
+            if !profile.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!profile.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "opens a temporary local Chrome window"]
+    async fn visible_chrome_opens_a_blank_page_and_cleans_up() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root =
+            std::env::temp_dir().join(format!("nurb-browser-visible-{}", std::process::id()));
+        let browser = launch(&root, true).await.unwrap();
+        let endpoint = reqwest::Url::parse(&browser.endpoint()).unwrap();
+        let url = format!("http://127.0.0.1:{}/json/list", endpoint.port().unwrap());
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let mut blank_page = false;
+        for _ in 0..50 {
+            let pages: serde_json::Value =
+                client.get(&url).send().await.unwrap().json().await.unwrap();
+            blank_page = pages
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|page| page["type"] == "page" && page["url"] == "about:blank");
+            if blank_page {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(blank_page);
+        let profile = browser.profile.clone();
         drop(browser);
         for _ in 0..100 {
             if !profile.exists() {

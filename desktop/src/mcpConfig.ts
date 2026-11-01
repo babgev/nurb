@@ -4,6 +4,7 @@ export type McpConfig = {
   enabled: boolean;
   transport: "stdio" | "http";
   preset?: "browser";
+  browserVisible?: boolean;
   command?: string;
   args: string[];
   env: Record<string, string>;
@@ -18,7 +19,7 @@ export type McpStatus = {
   checkedAt?: number;
 };
 
-export type McpServer = Pick<McpConfig, "id" | "name" | "enabled" | "transport" | "preset"> & {
+export type McpServer = Pick<McpConfig, "id" | "name" | "enabled" | "transport" | "preset" | "browserVisible"> & {
   envKeys: string[];
   headerKeys: string[];
   status: McpStatus;

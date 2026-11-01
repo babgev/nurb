@@ -579,6 +579,7 @@ pub fn run() {
             mcp::get_mcp_server,
             mcp::save_mcp_server,
             mcp::set_mcp_enabled,
+            mcp::set_mcp_browser_visible,
             mcp::remove_mcp_server,
             mcp::check_mcp_server,
             mcp::mcp_session_status,

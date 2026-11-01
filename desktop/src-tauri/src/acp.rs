@@ -1266,7 +1266,7 @@ async fn run_chat(
         Ok(snapshot) => snapshot,
         Err(message) => { let _ = ready_tx.send(Err(agent_client_protocol::Error::new(-32603, message))); return; }
     };
-    let browser_setup = crate::mcp::prepare_presets(&mut mcp_snapshot.1, &launcher);
+    let browser_setup = crate::mcp::prepare_presets(&mut mcp_snapshot.1, &launcher, crate::mcp::PresetPurpose::Conversation);
     let _mcp_browsers = tokio::select! {
         result = browser_setup => match result {
             Ok(browsers) => browsers,

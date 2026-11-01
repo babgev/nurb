@@ -28,6 +28,8 @@ pub struct ServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
     #[serde(default)]
+    pub browser_visible: bool,
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -76,6 +78,7 @@ pub struct ServerView {
     transport: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     preset: Option<String>,
+    browser_visible: bool,
     env_keys: Vec<String>,
     header_keys: Vec<String>,
     status: CheckStatus,
@@ -137,6 +140,7 @@ impl McpStore {
             enabled: server.enabled,
             transport: server.transport.clone(),
             preset: server.preset.clone(),
+            browser_visible: server.browser_visible,
             env_keys: server.env.keys().cloned().collect(),
             header_keys: server.headers.keys().cloned().collect(),
             status: if !server.enabled {
@@ -463,6 +467,26 @@ pub fn set_mcp_enabled(
     save_mcp_server(app, store, server)
 }
 #[tauri::command]
+pub fn set_mcp_browser_visible(
+    app: tauri::AppHandle,
+    store: State<McpStore>,
+    id: String,
+    visible: bool,
+) -> Result<ServerView, String> {
+    let server = browser_visibility(store.get(&id)?, visible)?;
+    save_mcp_server(app, store, server)
+}
+
+fn browser_visibility(mut server: ServerConfig, visible: bool) -> Result<ServerConfig, String> {
+    if server.preset.as_deref() != Some("browser") {
+        return Err(
+            "Browser visibility is only available for the managed Browser connection.".into(),
+        );
+    }
+    server.browser_visible = visible;
+    Ok(server)
+}
+#[tauri::command]
 pub fn remove_mcp_server(
     app: tauri::AppHandle,
     store: State<McpStore>,
@@ -488,10 +512,10 @@ pub fn mcp_browser_preset(
     store: State<McpStore>,
     launcher: State<crate::env::Launcher>,
 ) -> Result<ServerView, String> {
-    save_mcp_server(app, store, browser_config(&launcher)?)
+    save_mcp_server(app, store, browser_config(&launcher, false)?)
 }
 
-fn browser_config(launcher: &crate::env::Launcher) -> Result<ServerConfig, String> {
+fn browser_config(launcher: &crate::env::Launcher, visible: bool) -> Result<ServerConfig, String> {
     let output = launcher.engine_root().join("mcp/browser-output");
     std::fs::create_dir_all(&output)
         .map_err(|_| "Cannot create the browser output folder.".to_string())?;
@@ -524,8 +548,10 @@ fn browser_config(launcher: &crate::env::Launcher) -> Result<ServerConfig, Strin
             vec!["-y".into(), format!("@playwright/mcp@{version}")],
         )
     };
+    if !visible {
+        args.push("--headless".into());
+    }
     args.extend([
-        "--headless".into(),
         "--isolated".into(),
         "--browser".into(),
         "chrome".into(),
@@ -538,6 +564,7 @@ fn browser_config(launcher: &crate::env::Launcher) -> Result<ServerConfig, Strin
         enabled: true,
         transport: "stdio".into(),
         preset: Some("browser".into()),
+        browser_visible: visible,
         command,
         args,
         env: BTreeMap::new(),
@@ -546,17 +573,29 @@ fn browser_config(launcher: &crate::env::Launcher) -> Result<ServerConfig, Strin
     })
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum PresetPurpose {
+    Conversation,
+    Check,
+}
+
+fn visible_browser(config: &ServerConfig, purpose: PresetPurpose) -> bool {
+    config.browser_visible && purpose == PresetPurpose::Conversation
+}
+
 pub async fn prepare_presets(
     configs: &mut [ServerConfig],
     launcher: &crate::env::Launcher,
+    purpose: PresetPurpose,
 ) -> Result<Vec<crate::mcp_browser::BrowserSession>, String> {
     let mut browsers = Vec::new();
     for config in configs
         .iter_mut()
         .filter(|s| s.enabled && s.preset.as_deref() == Some("browser"))
     {
-        let mut managed = browser_config(launcher)?;
-        let browser = crate::mcp_browser::launch(&launcher.engine_root()).await?;
+        let visible = visible_browser(config, purpose);
+        let mut managed = browser_config(launcher, visible)?;
+        let browser = crate::mcp_browser::launch(&launcher.engine_root(), visible).await?;
         let output = browser.output_dir();
         std::fs::create_dir_all(&output)
             .map_err(|_| "Cannot create browser download folder.".to_string())?;
@@ -609,7 +648,7 @@ pub async fn check_mcp_server(
         .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
     let result = tokio::time::timeout(CHECK_TIMEOUT, async {
         let mut prepared = vec![server.clone()];
-        let _browsers = prepare_presets(&mut prepared, &launcher).await?;
+        let _browsers = prepare_presets(&mut prepared, &launcher, PresetPurpose::Check).await?;
         let server = &prepared[0];
         match server.transport.as_str() {
             "stdio" => {
@@ -1063,12 +1102,52 @@ mod tests {
             enabled: true,
             transport: "stdio".into(),
             preset: None,
+            browser_visible: false,
             command: "/usr/bin/python3".into(),
             args: vec![],
             env: BTreeMap::new(),
             url: String::new(),
             headers: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn browser_visibility_defaults_hidden_and_persists_without_replacing_settings() {
+        let root = Scratch::new();
+        let store = McpStore::load(&root.0);
+        let mut browser = server();
+        browser.id = "browser".into();
+        browser.name = "Browser".into();
+        browser.preset = Some("browser".into());
+        browser.args = vec!["--original-argument".into()];
+        browser
+            .env
+            .insert("TOKEN".into(), "keep-environment-value".into());
+        browser
+            .headers
+            .insert("Authorization".into(), "keep-header-value".into());
+        let mut legacy = serde_json::to_value(&browser).unwrap();
+        legacy.as_object_mut().unwrap().remove("browserVisible");
+        let legacy: ServerConfig = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy.browser_visible);
+        store.save(legacy).unwrap();
+        let updated = browser_visibility(store.get("browser").unwrap(), true).unwrap();
+        let view = store.save(updated).unwrap();
+        assert!(view.browser_visible);
+        let restored = McpStore::load(&root.0).get("browser").unwrap();
+        browser.browser_visible = true;
+        assert_eq!(restored, browser);
+        assert!(browser_visibility(server(), true).is_err());
+    }
+
+    #[test]
+    fn connection_checks_never_open_a_visible_browser() {
+        let mut browser = server();
+        browser.preset = Some("browser".into());
+        assert!(!visible_browser(&browser, PresetPurpose::Conversation));
+        browser.browser_visible = true;
+        assert!(visible_browser(&browser, PresetPurpose::Conversation));
+        assert!(!visible_browser(&browser, PresetPurpose::Check));
     }
 
     #[test]

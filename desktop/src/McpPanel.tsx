@@ -212,6 +212,10 @@ export default function McpPanel({ path, sessionId, hidden = false }: { path: st
         {selectedServer && <section className="mcp-details" aria-label={`${selectedServer.name} details`}>
           <div className="mcp-detail-heading"><strong>{selectedServer.name}</strong><label className="mcp-checkbox"><input type="checkbox" checked={selectedServer.enabled} disabled={working} onChange={(event) => { const enabled = event.target.checked; void action(async () => { await invoke("set_mcp_enabled", { id: selectedServer.id, enabled }); await load(); }); }} />Enabled</label></div>
           <p>{selectedServer.transport === "stdio" ? "Local command" : "HTTP server"}{selectedServer.envKeys?.length || selectedServer.headerKeys?.length ? " · Saved credentials" : ""}</p>
+          {selectedServer.preset === "browser" && <>
+            <label className="mcp-checkbox"><input type="checkbox" checked={selectedServer.browserVisible ?? false} disabled={working} onChange={(event) => { const visible = event.target.checked; void action(async () => { await invoke("set_mcp_browser_visible", { id: selectedServer.id, visible }); await load(); }); }} />Show browser window</label>
+            <p className="mcp-hint">Opens isolated Chrome for new or reopened conversations so you can complete sign-in or human verification yourself. Running connections stay unchanged; connection checks stay hidden.</p>
+          </>}
           {selectedServer.status.error && <div className="mcp-error" role="status">{selectedServer.status.error}</div>}
           {session?.unsupportedIds.includes(selectedServer.id) && <p className="mcp-error">This server could not be attached to the agent. Check its command and connection type, then open a new conversation.</p>}
           {session?.attachedIds.includes(selectedServer.id) && <p className="mcp-hint">Provided to this conversation’s agent. The agent controls tool access.</p>}
