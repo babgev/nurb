@@ -1218,14 +1218,36 @@ for line in sys.stdin:
         let mut config = server();
         let pidfile = root.0.join("child.pid");
         config.args = vec!["-u".into(), "-c".into(), "import os,subprocess,time,sys; p=subprocess.Popen(['/bin/sleep','60']); open(sys.argv[1],'w').write(str(p.pid)); time.sleep(60)".into(), pidfile.to_string_lossy().into_owned()];
-        assert!(tokio::time::timeout(
-            Duration::from_secs(2),
-            probe_stdio(&config, &root.0, &root.0, "/usr/bin:/bin")
-        )
+        let mut probe = Box::pin(probe_stdio(&config, &root.0, &root.0, "/usr/bin:/bin"));
+        // Cancel only after the fixture has actually spawned its descendant.
+        // A fixed startup timeout races Python launch on loaded CI machines.
+        let pid: i32 = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                tokio::select! {
+                    result = &mut probe => panic!("MCP fixture exited before readiness: {result:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                        if let Ok(pid) = std::fs::read_to_string(&pidfile)
+                            .and_then(|value| value.parse().map_err(std::io::Error::other))
+                        {
+                            break pid;
+                        }
+                    }
+                }
+            }
+        })
         .await
-        .is_err());
-        let pid: i32 = std::fs::read_to_string(pidfile).unwrap().parse().unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        .expect("MCP fixture did not publish its descendant PID");
+        // Owning the pinned future here makes timeout drop its process guard.
+        assert!(tokio::time::timeout(Duration::from_millis(20), probe)
+            .await
+            .is_err());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Cancelled MCP probe left its descendant running");
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
     }
 
