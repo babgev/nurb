@@ -24,6 +24,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DESKTOP="$SCRIPT_DIR/.."
 cd "$DESKTOP"
 
+# Fork releases require their own signing key and update feed before publishing.
+if ! python3 -c 'import json, sys; c = json.load(open("src-tauri/tauri.conf.json")); sys.exit(not c["bundle"].get("createUpdaterArtifacts", False))'; then
+  echo "Release publishing is disabled until this fork has its own signed update channel."
+  exit 1
+fi
+
 if [ -f .env ]; then
   set -a
   source .env
@@ -42,7 +48,7 @@ export APPLE_SIGNING_IDENTITY APPLE_API_KEY APPLE_API_ISSUER APPLE_API_KEY_PATH 
 VERSION=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
 PYVERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' ../pyproject.toml | head -1)
 TAG="v$VERSION"
-REPO="Shpigford/nurb"
+REPO="babgev/nurb"
 
 if [ "$VERSION" != "$PYVERSION" ]; then
   echo "❌ tauri.conf.json says $VERSION but pyproject.toml says $PYVERSION."

@@ -13,8 +13,9 @@ export class AttachmentDraft {
   private pending: Promise<string[]>[] = [];
   private readonly onChange: (files: string[]) => void;
 
-  constructor(onChange: (files: string[]) => void) {
+  constructor(onChange: (files: string[]) => void, files: string[] = []) {
     this.onChange = onChange;
+    this.files = [...files];
   }
 
   get hasContent(): boolean {
@@ -47,6 +48,11 @@ export class AttachmentDraft {
       })
       .catch(() => {});
     return pending.then(() => undefined);
+  }
+
+  async snapshot(): Promise<string[]> {
+    const settled = await Promise.allSettled([...this.pending]);
+    return [...new Set([...this.files, ...settled.flatMap((result) => result.status === "fulfilled" ? result.value : [])])];
   }
 
   async take(): Promise<string[]> {

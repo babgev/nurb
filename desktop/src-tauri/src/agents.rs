@@ -14,8 +14,28 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
+
+// The shipped manifest also drives development's npx pins, so an adapter update
+// cannot leave the packaged and development apps running different versions.
+static ADAPTER_PINS: LazyLock<std::collections::HashMap<String, String>> = LazyLock::new(|| {
+    #[derive(serde::Deserialize)]
+    struct Manifest {
+        dependencies: std::collections::HashMap<String, String>,
+    }
+    let manifest: Manifest =
+        serde_json::from_str(include_str!("../../adapter-runtime/package.json"))
+            .expect("the bundled adapter manifest must be valid");
+    manifest
+        .dependencies
+        .into_iter()
+        .map(|(package, version)| {
+            let pin = format!("{package}@{version}");
+            (package, pin)
+        })
+        .collect()
+});
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AgentKind {
@@ -68,15 +88,19 @@ impl AgentKind {
         }
     }
 
-    /// Exact adapter pins for the adapter-hosted agents; both projects
-    /// release weekly, so no ranges. None for the ACP-native CLIs.
+    /// Exact adapter pins from the bundled manifest. None for ACP-native CLIs.
     pub fn adapter(self) -> Option<&'static str> {
-        match self {
-            Self::Claude => Some("@agentclientprotocol/claude-agent-acp@0.74.0"),
-            Self::Codex => Some("@agentclientprotocol/codex-acp@1.10.0"),
-            Self::Gemini => Some("@google/gemini-cli@0.55.1"),
-            Self::Cursor | Self::Grok => None,
-        }
+        let package = match self {
+            Self::Claude => "@agentclientprotocol/claude-agent-acp",
+            Self::Codex => "@agentclientprotocol/codex-acp",
+            Self::Gemini => "@google/gemini-cli",
+            Self::Cursor | Self::Grok => return None,
+        };
+        Some(
+            ADAPTER_PINS
+                .get(package)
+                .expect("agent missing from bundled manifest"),
+        )
     }
 
     /// The executable name npm installs for the adapter, for spawning it out
@@ -248,7 +272,7 @@ fn auth_file(dir: &str) -> PathBuf {
         .join("auth.json")
 }
 
-const GEMINI_KEYCHAIN_SERVICE: &str = "dev.nurb.desktop.gemini-api-key";
+const GEMINI_KEYCHAIN_SERVICE: &str = "io.github.babgev.nurb.gemini-api-key";
 const GEMINI_KEYCHAIN_ACCOUNT: &str = "gemini";
 
 pub(crate) fn gemini_api_key() -> Result<String, String> {
@@ -487,6 +511,10 @@ mod tests {
             let (package, version) = adapter.rsplit_once('@').unwrap();
             assert_eq!(manifest["dependencies"][package], version);
             assert_eq!(locked[package], version);
+            assert_eq!(
+                lock["packages"][format!("node_modules/{package}")]["version"],
+                version
+            );
         }
     }
 

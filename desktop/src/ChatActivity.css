@@ -1,0 +1,21 @@
+.chat-activity {
+  position: sticky;
+  bottom: 0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 9px 11px;
+  background: var(--panel);
+  font-size: 12px;
+}
+.chat-activity-main { display: flex; gap: 8px; align-items: baseline; }
+.chat-activity-title { min-width: 0; flex: 1; overflow-wrap: anywhere; }
+.chat-activity-time { flex: none; color: var(--dim); font: 11px var(--mono); }
+.chat-activity-detail { color: var(--dim); font-size: 11px; margin-top: 5px; line-height: 1.5; }
+.chat-activity.quiet { border-color: var(--amber); }
+.chat-tool-heading { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 7px; }
+.chat-tool-heading .chat-tool-title { flex: 0 1 auto; }
+.chat-tool-preview { min-width: 0; flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--dim); font: 11px var(--mono); }
+.chat-tool-duration { color: var(--dimmer); font: 10px var(--mono); }
+.chat-tool-detail-label { font-size: 10px; color: var(--dimmer); text-transform: uppercase; letter-spacing: .04em; }
+.chat-activity-disconnect { margin-top: 7px; color: var(--bad); border: 1px solid var(--line); background: transparent; border-radius: 4px; padding: 4px 7px; cursor: pointer; font-size: 11px; }
+.chat-tool.interrupted .chat-tool-status { color: var(--dim); }

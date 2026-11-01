@@ -115,17 +115,24 @@ impl PrefStore {
         let rows = prefs
             .chosen
             .get("model")
+            .filter(|model| {
+                prefs.rows.iter().any(|row| {
+                    row.category == "model"
+                        && row.options.iter().any(|choice| choice.value == **model)
+                })
+            })
             .and_then(|model| prefs.model_rows.get(model))
             .unwrap_or(&prefs.rows);
-        rows
-            .iter()
+        rows.iter()
             .filter(|row| !row.category.is_empty())
             .map(|row| match prefs.chosen.get(&row.category) {
-                Some(value) => ConfigRow {
-                    value: value.clone(),
-                    ..row.clone()
-                },
-                None => row.clone(),
+                Some(value) if row.options.iter().any(|choice| choice.value == *value) => {
+                    ConfigRow {
+                        value: value.clone(),
+                        ..row.clone()
+                    }
+                }
+                _ => row.clone(),
             })
             .collect()
     }
@@ -136,9 +143,7 @@ impl PrefStore {
         }
         let mut agents = self.agents.lock().unwrap();
         let prefs = agents.entry(agent.to_string()).or_default();
-        prefs
-            .chosen
-            .insert(category.to_string(), value.to_string());
+        prefs.chosen.insert(category.to_string(), value.to_string());
         normalize_effort(prefs);
         self.save(&agents);
     }
@@ -148,8 +153,14 @@ impl PrefStore {
         if rows.is_empty() {
             return;
         }
+        self.replace_cache(agent, rows);
+    }
+
+    /// A live config update is authoritative even when it removes every option.
+    pub fn replace_cache(&self, agent: &str, rows: Vec<ConfigRow>) {
         let mut agents = self.agents.lock().unwrap();
-        agents.entry(agent.to_string()).or_default().rows = rows;
+        let prefs = agents.entry(agent.to_string()).or_default();
+        prefs.rows = rows;
         self.save(&agents);
     }
 
@@ -190,10 +201,7 @@ fn normalize_effort(prefs: &mut AgentPrefs) {
     let Some(chosen) = prefs.chosen.get("thought_level") else {
         return;
     };
-    let valid = effort
-        .options
-        .iter()
-        .any(|option| option.value == *chosen);
+    let valid = effort.options.iter().any(|option| option.value == *chosen);
     if !valid {
         prefs
             .chosen
@@ -234,6 +242,15 @@ mod tests {
         }
     }
 
+    fn with_choice(mut row: ConfigRow, value: &str) -> ConfigRow {
+        row.options.push(ConfigChoice {
+            value: value.into(),
+            name: value.into(),
+            description: None,
+        });
+        row
+    }
+
     #[test]
     fn nothing_is_stored_until_the_user_chooses() {
         let dir = scratch("empty");
@@ -272,8 +289,17 @@ mod tests {
         let store = PrefStore::load(&dir);
         store.remember("claude", "thought_level", "low");
         store.remember("codex", "thought_level", "high");
-        store.cache("claude", vec![row("effort", "thought_level", "xhigh")]);
-        store.cache("codex", vec![row("reasoning_effort", "thought_level", "medium")]);
+        store.cache(
+            "claude",
+            vec![with_choice(row("effort", "thought_level", "xhigh"), "low")],
+        );
+        store.cache(
+            "codex",
+            vec![with_choice(
+                row("reasoning_effort", "thought_level", "medium"),
+                "high",
+            )],
+        );
 
         let reloaded = PrefStore::load(&dir);
         assert_eq!(reloaded.rows("claude")[0].id, "effort");
@@ -307,12 +333,58 @@ mod tests {
     fn cached_rows_show_the_users_pick_not_the_last_session() {
         let dir = scratch("cache");
         let store = PrefStore::load(&dir);
-        store.cache("claude", vec![row("model", "model", "opus[1m]")]);
+        store.cache(
+            "claude",
+            vec![with_choice(row("model", "model", "opus[1m]"), "sonnet")],
+        );
         store.remember("claude", "model", "sonnet");
 
         let rows = PrefStore::load(&dir).rows("claude");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].value, "sonnet");
+    }
+
+    #[test]
+    fn unavailable_choices_show_the_agents_current_default() {
+        let dir = scratch("unavailable");
+        let store = PrefStore::load(&dir);
+        store.remember("claude", "model", "retired-model");
+        store.remember("claude", "thought_level", "retired-effort");
+        store.cache(
+            "claude",
+            vec![
+                row("model", "model", "current-model"),
+                row("effort", "thought_level", "medium"),
+            ],
+        );
+        // Even a stale per-model cache must not resurrect a removed model.
+        store.cache_model_rows(
+            "claude",
+            HashMap::from([(
+                "retired-model".into(),
+                vec![row("model", "model", "retired-model")],
+            )]),
+        );
+
+        let rows = PrefStore::load(&dir).rows("claude");
+        assert_eq!(rows[0].value, "current-model");
+        assert_eq!(rows[1].value, "medium");
+    }
+
+    #[test]
+    fn an_explicit_empty_update_clears_cached_menus_but_not_user_preferences() {
+        let dir = scratch("empty-update");
+        let store = PrefStore::load(&dir);
+        store.cache("claude", vec![row("model", "model", "preferred")]);
+        store.remember("claude", "model", "preferred");
+        store.replace_cache("claude", Vec::new());
+
+        let reloaded = PrefStore::load(&dir);
+        assert!(reloaded.rows("claude").is_empty());
+        assert_eq!(
+            reloaded.chosen("claude"),
+            vec![("model".into(), "preferred".into())]
+        );
     }
 
     #[test]
@@ -357,10 +429,7 @@ mod tests {
         store.cache("grok", grok_46.clone());
         store.cache_model_rows(
             "grok",
-            HashMap::from([
-                ("grok-4.6".into(), grok_46),
-                ("grok-4.5".into(), grok_45),
-            ]),
+            HashMap::from([("grok-4.6".into(), grok_46), ("grok-4.5".into(), grok_45)]),
         );
         store.remember("grok", "model", "grok-4.6");
         assert_eq!(
@@ -374,10 +443,7 @@ mod tests {
         assert_eq!(rows[0].value, "grok-4.5");
         assert_eq!(rows[1].value, "high");
         assert_eq!(rows[1].options.len(), 3);
-        assert!(!rows[1]
-            .options
-            .iter()
-            .any(|option| option.value == "xhigh"));
+        assert!(!rows[1].options.iter().any(|option| option.value == "xhigh"));
         assert_eq!(
             store.chosen("grok"),
             vec![

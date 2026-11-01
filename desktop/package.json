@@ -8,6 +8,7 @@
     "build": "tsc && vite build",
     "test": "node --test tests/*.test.ts",
     "stage": "sh scripts/stage.sh",
+    "install:mac": "sh scripts/install-macos.sh",
     "preview": "vite preview",
     "tauri": "tauri"
   },
