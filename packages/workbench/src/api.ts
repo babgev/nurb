@@ -1,4 +1,4 @@
-import type { AssemblyJoint, ExportFormat, Finding, Message, Param, Params, Spec } from "@nurb/ui"
+import type { ExportFormat, Finding, Message, Param, Params, Spec } from "@nurb/ui"
 
 export interface ProjectSummary {
   id: string
@@ -33,7 +33,7 @@ export interface PartBuild {
   finished_at: string | null
   error: string | null
   findings: Finding[]
-  stats: { bbox?: [number, number, number]; volume?: number; ms?: number; joints?: AssemblyJoint[]; [key: string]: unknown }
+  stats: { bbox?: [number, number, number]; volume?: number; ms?: number; [key: string]: unknown }
   glb_url: string | null
   render_url: string | null
   // One view on a transparent ground, for a library card.

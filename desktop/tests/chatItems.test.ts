@@ -164,13 +164,3 @@ test("the working line names the running call in plain words", () => {
   assert.equal(activity(running), "building the part");
   assert.equal(activity([]), "working");
 });
-
-
-test("update-only tools remain visible with their real output", () => {
-  const items = applyChatEvent([], { type: "tool_call_update", id: "late", title: "browser_snapshot", status: "completed", output: "Readable listing" }, 1000);
-  assert.equal(items.length, 1);
-  assert.equal(items[0].kind, "step");
-  if (items[0].kind !== "step") return;
-  assert.equal(items[0].tool, "browser_snapshot");
-  assert.equal(items[0].step.output, "Readable listing");
-});

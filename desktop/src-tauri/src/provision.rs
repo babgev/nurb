@@ -1099,25 +1099,14 @@ with zipfile.ZipFile(sys.argv[1], "w") as z:
         std::fs::create_dir_all(paths.adapters().join("node_modules/.bin")).unwrap();
 
         let node = paths.node_bin();
-        let adapter_version =
-            |kind: crate::agents::AgentKind| kind.adapter().unwrap().rsplit_once('@').unwrap().1;
-        let claude_version = adapter_version(crate::agents::AgentKind::Claude);
-        let codex_version = adapter_version(crate::agents::AgentKind::Codex);
-        let gemini_version = adapter_version(crate::agents::AgentKind::Gemini);
         std::fs::write(
             &node,
             format!(
                 r#"#!/bin/sh
 case "$*" in
   "--version") echo "{NODE_VERSION}" ;;
-  *"claude-agent-acp --cli --version"*)
-    [ ! -f "$0.missing-claude" ] || exit 1
-    [ ! -f "$0.slow-claude" ] || sleep 3
-    echo "2.1.257 (Claude Code)"
-    ;;
-  *"claude-agent-acp --version"*) echo "claude-agent-acp {claude_version}" ;;
-  *"codex-acp --version"*) echo "codex-acp {codex_version}" ;;
-  *"gemini --version"*) echo "{gemini_version}" ;;
+  *"codex-acp --version"*) echo "@agentclientprotocol/codex-acp 2.5.0" ;;
+    *"gemini --version"*) echo "0.66.0" ;;
   *"/codex --version"*)
     [ ! -f "$0.missing-codex" ] || exit 1
     [ ! -f "$0.slow-codex" ] || sleep 3
@@ -1130,7 +1119,7 @@ esac
         )
         .unwrap();
         std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
-        for agent in ["claude-agent-acp", "codex-acp", "gemini", "codex"] {
+        for agent in ["codex-acp", "gemini", "codex"] {
             std::fs::write(paths.adapters().join("node_modules/.bin").join(agent), b"").unwrap();
         }
 

@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   AttachmentDraft,
-  stashDraft,
-  unstashDraft,
   restoreDraftFiles,
   restoreDraftText,
+  stashDraft,
+  unstashDraft,
 } from "../src/chatDraft.ts";
 
 test("an auth failure preserves work composed during the failed turn", () => {
@@ -45,48 +45,12 @@ test("submission waits for every paste already being saved", async () => {
   assert.deepEqual(shown, []);
 });
 
-
-test("provider changes carry existing and pending attachments into the remounted composer", async () => {
-  let finishPaste!: (paths: string[]) => void;
-  const paste = new Promise<string[]>((resolve) => { finishPaste = resolve; });
-  const original = new AttachmentDraft(() => {}, ["design.stl"]);
-  original.track(paste);
-  const transferred = original.take();
-  finishPaste(["reference.png"]);
-  const files = await transferred;
-  const newComposer = new AttachmentDraft(() => {}, files);
-
-  assert.equal(original.hasContent, false);
-  assert.equal(newComposer.hasContent, true);
-  assert.deepEqual(await newComposer.take(), ["design.stl", "reference.png"]);
-  assert.deepEqual(files, ["design.stl", "reference.png"]);
-});
-
-test("a refused provider switch can restore the original attachments", async () => {
-  let shown: string[] = [];
-  const draft = new AttachmentDraft((files) => { shown = files; }, ["design.stl"]);
-  const transferred = await draft.take();
-  draft.restore(transferred);
-  assert.deepEqual(shown, ["design.stl"]);
-  assert.deepEqual(await draft.take(), ["design.stl"]);
-});
-
-
-test("opening another provider tab copies pending attachments without consuming the source draft", async () => {
-  let finish!: (paths: string[]) => void;
-  const draft = new AttachmentDraft(() => {}, ["model.stl"]);
-  draft.track(new Promise<string[]>((resolve) => { finish = resolve; }));
-  const copied = draft.snapshot();
-  finish(["reference.png"]);
-  assert.deepEqual(await copied, ["model.stl", "reference.png"]);
-  assert.equal(draft.hasContent, true);
-  assert.deepEqual(await draft.take(), ["model.stl", "reference.png"]);
-});
-
-
-test("a stashed tab draft returns once without leaking to a sibling", () => {
-  stashDraft("first", { text: "Pending", files: ["reference.png"] });
-  assert.deepEqual(unstashDraft("second"), { text: "", files: [] });
-  assert.deepEqual(unstashDraft("first"), { text: "Pending", files: ["reference.png"] });
-  assert.deepEqual(unstashDraft("first"), { text: "", files: [] });
+test("a stashed draft outlives its column and comes back once", () => {
+  stashDraft("loose\u0000bin", { text: "make it taller", files: ["/tmp/a.png"] });
+  assert.deepEqual(unstashDraft("other\u0000bin"), { text: "", files: [] });
+  assert.deepEqual(unstashDraft("loose\u0000bin"), { text: "make it taller", files: ["/tmp/a.png"] });
+  assert.deepEqual(unstashDraft("loose\u0000bin"), { text: "", files: [] });
+  stashDraft("loose\u0000bin", { text: "kept", files: [] });
+  stashDraft("loose\u0000bin", { text: "  ", files: [] });
+  assert.deepEqual(unstashDraft("loose\u0000bin"), { text: "", files: [] });
 });

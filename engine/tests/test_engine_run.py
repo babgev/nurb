@@ -285,22 +285,3 @@ def test_a_revision_is_built_once_when_two_callers_race(conn, monkeypatch, tmp_p
         "SELECT COUNT(*) FROM build_runs WHERE revision_id = ?", (revision,)
     ).fetchone()[0]
     assert runs == 1
-
-
-def test_build_carries_hinge_metadata_for_live_slider_preview(tmp_path):
-    parts = tmp_path / "parts"
-    parts.mkdir()
-    (parts / "lid.py").write_text('''from nurb import *
-@assembly
-def lid(lid_open=25.0):
-    flap = hinge(Box(12, 8, 2), Axis((0, 0, 0), (1, 0, 0)), through=(0, 120), at=lid_open, name="lid")
-    return (flap,)
-''')
-    result = engine_run.build(tmp_path, "lid")
-    assert result["error"] is None
-    assert result["stats"]["joints"] == [{
-        "node": "joint0", "param": "lid_open", "name": "lid",
-        "origin": [0.0, 0.0, 0.0], "dir": [1.0, 0.0, 0.0],
-        "lo": 0, "hi": 120, "at": 25.0,
-    }]
-    assert any(p["name"] == "lid_open" for p in result["params"])

@@ -411,7 +411,6 @@ pub async fn start_chat(
     on_event: Channel<ChatEvent>,
     resume: Option<String>,
     startup_id: Option<String>,
-    initial_config: Option<HashMap<String, String>>,
 ) -> Result<String, String> {
     let kind = AgentKind::parse(&agent)?;
     let project = PathBuf::from(&path);
@@ -434,7 +433,7 @@ pub async fn start_chat(
         let result = tokio::select! {
             biased;
             _ = startup_cancelled(startup_rx) => Err("Conversation startup cancelled.".into()),
-            result = crate::claude::start(app.clone(), project, part, on_event, resume, initial_config) => result,
+            result = crate::claude::start(app.clone(), project, part, on_event, resume) => result,
         };
         if let Some(id) = startup_id {
             use tauri::Manager;
@@ -453,7 +452,6 @@ pub async fn start_chat(
         close_tx,
         close_rx,
         startup_rx,
-        initial_config,
     ));
     let ready = ready_rx.await;
     if let Some(id) = startup_id {
@@ -1687,32 +1685,6 @@ async fn apply_choices(
 }
 
 /// Refresh one provider independently without sending a prompt or listing history.
-#[tauri::command]
-pub async fn refresh_chat_config(
-    app: tauri::AppHandle,
-    path: String,
-    agent: String,
-) -> Result<Vec<ConfigRow>, String> {
-    use tauri::{Emitter, Manager};
-    let kind = AgentKind::parse(&agent)?;
-    let launcher = app.state::<crate::env::Launcher>().inner().clone();
-    let (_, config, model_rows) = agent_sessions(
-        &launcher,
-        kind,
-        PathBuf::from(path),
-        serve_entry(&app, false).await,
-        true,
-    )
-    .await?;
-    let prefs = app.state::<PrefStore>();
-    prefs.replace_cache(kind.id(), config);
-    if kind == AgentKind::Grok {
-        prefs.cache_model_rows(kind.id(), model_rows);
-    }
-    let _ = app.emit("agent-config", ());
-    Ok(prefs.rows(kind.id()))
-}
-
 /// What the picker draws. A part's chat has no adapter until its first message,
 /// so with no session running this answers from the remembered lists.
 #[tauri::command]
@@ -1724,11 +1696,6 @@ pub fn chat_config(
     use tauri::Manager;
     let kind = AgentKind::parse(&agent)?;
     if kind == AgentKind::Claude {
-        if let Some(id) = session_id.as_ref() {
-            if let Some(driver) = app.state::<crate::claude::Drivers>().get(id) {
-                return Ok(driver.config());
-            }
-        }
         return Ok(crate::claude::config_rows(&app.state::<PrefStore>()));
     }
     if let Some(id) = session_id {
@@ -1756,6 +1723,9 @@ pub async fn probe_chat_config(
 ) -> Result<Vec<ConfigRow>, String> {
     use tauri::Manager;
     let kind = AgentKind::parse(&agent)?;
+    if kind == AgentKind::Claude {
+        return Ok(crate::claude::config_rows(&app.state::<PrefStore>()));
+    }
     let cached = app.state::<PrefStore>().rows(kind.id());
     if !cached.is_empty() {
         return Ok(cached);
@@ -1788,29 +1758,12 @@ pub async fn set_chat_config(
     use tauri::Manager;
     let kind = AgentKind::parse(&agent)?;
     if kind == AgentKind::Claude {
-        let available = crate::claude::config_rows(&app.state::<PrefStore>());
-        if !available.iter().any(|row| {
-            row.category == category && row.options.iter().any(|choice| choice.value == value)
-        }) {
-            return Err("This choice is no longer available. Refresh the model menu.".into());
+        let driver = session_id.and_then(|id| app.state::<crate::claude::Drivers>().get(&id));
+        if let (Some(driver), "model") = (driver, category.as_str()) {
+            driver.set_model(&value).await?;
         }
-        let driver = session_id
-            .as_ref()
-            .and_then(|id| app.state::<crate::claude::Drivers>().get(id));
-        let rows = if let Some(driver) = driver {
-            driver
-                .set_config(category.clone(), value.clone(), available)
-                .await?
-        } else if session_id.is_some() {
-            return Err("chat is not running".into());
-        } else {
-            app.state::<PrefStore>()
-                .remember(kind.id(), &category, &value);
-            return Ok(crate::claude::config_rows(&app.state::<PrefStore>()));
-        };
-        app.state::<PrefStore>()
-            .remember(kind.id(), &category, &value);
-        return Ok(rows);
+        app.state::<PrefStore>().remember(kind.id(), &category, &value);
+        return Ok(crate::claude::config_rows(&app.state::<PrefStore>()));
     }
     let live = session_id
         .map(|id| {
@@ -1925,7 +1878,6 @@ async fn run_chat(
     close_tx: oneshot::Sender<()>,
     close_rx: oneshot::Receiver<()>,
     startup_rx: oneshot::Receiver<()>,
-    initial_config: Option<HashMap<String, String>>,
 ) {
     use tauri::Manager;
     let cancelled = startup_cancelled(startup_rx);
@@ -2135,7 +2087,6 @@ async fn run_chat(
                 let chat_project = chat_project.clone();
                 let chat_pending = chat_pending.clone();
                 let chat_channel = chat_channel.clone();
-                let initial_config = initial_config.clone();
                 let mcp_snapshot = mcp_snapshot.clone();
                 let mcp_path = mcp_path.clone();
                 let mcp_attached = Arc::new(Mutex::new((Vec::new(), Vec::new())));
@@ -2156,7 +2107,7 @@ async fn run_chat(
                             mcp_entry(&init.agent_capabilities.mcp_capabilities, serve.as_ref());
                         if let Some(entry) = entry { mcp_servers.insert(0, entry); }
                         let menus = grok_model_menus(init.meta.as_ref()).unwrap_or_default();
-                        let chosen = initial_config.map(|values| crate::prefs::SHOWN.iter().filter_map(|category| values.get(*category).map(|value| ((*category).to_string(), value.clone()))).collect()).unwrap_or_else(|| chat_app.state::<PrefStore>().chosen(kind.id()));
+                        let chosen = chat_app.state::<PrefStore>().chosen(kind.id());
                         let open_meta = grok_open_meta(kind, &chosen);
                         if let Some(id) = resume {
                             // Restore chain: session/load replays the whole

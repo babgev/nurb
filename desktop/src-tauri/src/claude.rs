@@ -3,8 +3,8 @@
 //!
 //! No adapter sits in the middle, so the app owns the whole contract: the
 //! nurb tools are handed to the CLI as an http MCP server pointed at the
-//! serve alongside the enabled external MCP servers. Built-in CLI tools stay
-//! disabled, and event lines map onto the same ChatEvent channel ACP agents use.
+//! serve alongside configured browser/MCP servers, and the CLI's event lines map onto
+//! the same ChatEvent channel the ACP agents use.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,7 +15,7 @@ use serde_json::Value;
 use tauri::ipc::Channel;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 use crate::acp::events::{capped, mirror, ChatEvent};
 use crate::acp::sandbox;
@@ -25,6 +25,17 @@ use crate::prefs::{ConfigChoice, ConfigRow, PrefStore};
 /// The oldest CLI whose print mode waits for its MCP servers before the first
 /// turn. Older ones can start turn 1 with no nurb tools at all.
 const MINIMUM: (u32, u32, u32) = (2, 1, 221);
+
+/// The models the picker offers. The CLI resolves an alias against the user's
+/// plan, which is why there is no hardcoded model id here. Fable is the
+/// suggestion: on nurb's own parts it holds one coherent form where Opus
+/// builds a plinth and a cradle.
+const MODELS: [(&str, &str); 4] = [
+    ("default", "Default"),
+    ("fable", "Fable"),
+    ("opus", "Opus"),
+    ("sonnet", "Sonnet"),
+];
 
 /// How hard the model thinks, the CLI's `--effort` levels. Default leaves the
 /// flag off and lets the CLI decide.
@@ -48,23 +59,6 @@ pub(crate) struct Session {
     turn: Mutex<Option<oneshot::Sender<Result<String, String>>>>,
     /// Set by cancel, so the exit that follows reads as a stop, not a crash.
     stopped: AtomicBool,
-    changing: AtomicBool,
-    config: Arc<Mutex<Vec<ConfigRow>>>,
-    controls: mpsc::UnboundedSender<ConfigChange>,
-}
-
-struct Changing<'a>(&'a AtomicBool);
-impl Drop for Changing<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
-    }
-}
-
-struct ConfigChange {
-    category: String,
-    value: String,
-    available: Vec<ConfigRow>,
-    done: oneshot::Sender<Result<Vec<ConfigRow>, String>>,
 }
 
 /// The child's stdin and the prompt it has not answered yet. One lock, so a
@@ -131,9 +125,6 @@ impl Session {
         let (done, wait) = oneshot::channel();
         {
             let mut turn = self.turn.lock().unwrap();
-            if self.changing.load(Ordering::SeqCst) {
-                return Err("Claude is applying model settings. Try again in a moment.".into());
-            }
             if turn.is_some() {
                 return Err("Claude is still answering; wait for that to finish".into());
             }
@@ -155,29 +146,10 @@ impl Session {
             .map_err(|_| "Claude stopped unexpectedly".to_string())?
     }
 
-    pub(crate) fn config(&self) -> Vec<ConfigRow> {
-        self.config.lock().unwrap().clone()
-    }
-
-    /// Changing either pick restarts the idle child with the same conversation
-    /// id. This also applies effort, which has no live CLI control request.
-    pub(crate) async fn set_config(
-        &self,
-        category: String,
-        value: String,
-        available: Vec<ConfigRow>,
-    ) -> Result<Vec<ConfigRow>, String> {
-        let (done, wait) = oneshot::channel();
-        self.controls
-            .send(ConfigChange {
-                category,
-                value,
-                available,
-                done,
-            })
-            .map_err(|_| "Claude is no longer connected.".to_string())?;
-        wait.await
-            .map_err(|_| "Claude stopped while changing its settings.".to_string())?
+    /// Switches the running child, so the picker never names a model this
+    /// chat is not on. The CLI takes it between turns or mid-turn alike.
+    pub(crate) async fn set_model(&self, model: &str) -> Result<(), String> {
+        self.pipe.lock().await.write(&set_model_line(model)).await
     }
 
     /// SIGINT: measured on 2.1.272, the CLI answers with an
@@ -187,6 +159,16 @@ impl Session {
         self.stopped.store(true, Ordering::SeqCst);
         self.signal(libc::SIGINT);
     }
+}
+
+/// The CLI's own control request. "default" is an alias it understands, and
+/// resets the child to the plan's default model.
+pub(crate) fn set_model_line(model: &str) -> Value {
+    serde_json::json!({
+        "type": "control_request",
+        "request_id": uuid::Uuid::new_v4().to_string(),
+        "request": { "subtype": "set_model", "model": model },
+    })
 }
 
 /// How the CLI words a `--resume` of a session it has no transcript of.
@@ -443,9 +425,8 @@ fn result_text(content: Option<&Value>) -> String {
     }
 }
 
-/// Base argv for the native CLI: built-in tools disabled and only CAD allowed.
-/// Production adds configured MCP servers through a private file and keeps the
-/// existing operating-system sandbox around the whole child process.
+/// Base argv disables built-in tools and allows CAD. Production adds configured
+/// MCP servers through a private config file inside the existing agent sandbox.
 pub(crate) fn spawn_args(
     mcp_url: &str,
     token: &str,
@@ -541,7 +522,6 @@ pub(crate) fn spawn(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .process_group(0)
-        .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("could not start Claude: {e}"))
 }
@@ -589,15 +569,8 @@ pub(crate) async fn start(
     part: Option<String>,
     channel: Channel<ChatEvent>,
     resume: Option<String>,
-    initial_config: Option<HashMap<String, String>>,
 ) -> Result<String, String> {
     use tauri::Manager;
-    send(
-        &channel,
-        ChatEvent::Activity {
-            phase: "Checking Claude".into(),
-        },
-    );
     let bin = tauri::async_runtime::spawn_blocking(ready_binary)
         .await
         .map_err(|e| e.to_string())??;
@@ -612,30 +585,6 @@ pub(crate) async fn start(
     let project_id = crate::acp::project_key(&project);
     let launcher = app.state::<crate::env::Launcher>().inner().clone();
     let engine_root = launcher.engine_root();
-    if app
-        .state::<PrefStore>()
-        .rows(AgentKind::Claude.id())
-        .is_empty()
-    {
-        let _ = crate::acp::refresh_chat_config(
-            app.clone(),
-            project.to_string_lossy().into_owned(),
-            "claude".into(),
-        )
-        .await;
-    }
-    let mut current = config_rows(&app.state::<PrefStore>());
-    if let Some(initial) = initial_config {
-        for row in &mut current {
-            if let Some(value) = initial
-                .get(&row.category)
-                .filter(|value| row.options.iter().any(|choice| &choice.value == *value))
-            {
-                row.value = value.clone();
-            }
-        }
-    }
-    let current = Arc::new(Mutex::new(current));
     let mut snapshot = app.state::<crate::mcp::McpStore>().snapshot()?;
     send(
         &channel,
@@ -667,17 +616,19 @@ pub(crate) async fn start(
         &app.state::<crate::AppData>().0,
         &serde_json::json!({ "mcpServers": entries }),
     )?;
+
+    // The picks are read per spawn: one made since the last child still counts.
     let launch = {
+        let app = app.clone();
         let project = project.clone();
-        let current = Arc::clone(&current);
         let config_path = config_file.path().to_string_lossy().into_owned();
         move |session: &str, resume: bool| {
-            let chosen = current.lock().unwrap().clone();
+            let chosen = app.state::<PrefStore>().chosen(AgentKind::Claude.id());
             let pick = |category: &str| {
                 chosen
                     .iter()
-                    .find(|row| row.category == category)
-                    .map(|row| row.value.as_str())
+                    .find(|(key, _)| key == category)
+                    .map(|(_, value)| value.as_str())
             };
             let mut args = spawn_args(
                 &serve.url,
@@ -701,14 +652,7 @@ pub(crate) async fn start(
     let session_id = resume
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    send(
-        &channel,
-        ChatEvent::Activity {
-            phase: "Launching Claude".into(),
-        },
-    );
     let mut child = launch(&session_id, resume.is_some())?;
-    let (controls, control_rx) = mpsc::unbounded_channel();
     let pgid = child.id().unwrap_or_default() as i32;
     let stdin = child.stdin.take().ok_or("Claude has no input pipe")?;
     let stdout = child.stdout.take().ok_or("Claude has no output pipe")?;
@@ -723,9 +667,6 @@ pub(crate) async fn start(
         }),
         turn: Mutex::new(None),
         stopped: AtomicBool::new(false),
-        changing: AtomicBool::new(false),
-        config: current,
-        controls,
     });
     app.state::<Drivers>()
         .sessions
@@ -741,7 +682,7 @@ pub(crate) async fn start(
     let id = session_id.clone();
     tauri::async_runtime::spawn(async move {
         let (_browsers, _config_file) = (browsers, config_file);
-        let next = |resume| launch(&id, resume);
+        let fresh = || launch(&id, false);
         read_stream(
             child,
             stdout,
@@ -749,8 +690,7 @@ pub(crate) async fn start(
             &session,
             &id,
             resume.is_some(),
-            control_rx,
-            next,
+            fresh,
         )
         .await;
         app.state::<Drivers>().sessions.lock().unwrap().remove(&id);
@@ -768,43 +708,13 @@ async fn read_stream(
     session: &Session,
     session_id: &str,
     resumed: bool,
-    mut controls: mpsc::UnboundedReceiver<ConfigChange>,
-    launch: impl Fn(bool) -> Result<Child, String>,
+    fresh: impl Fn() -> Result<Child, String>,
 ) {
     // One session error per session: the column forgets the session on it.
     let mut reported = false;
     let mut resumed = resumed;
     let mut lines = BufReader::new(stdout).lines();
-    let mut has_transcript = resumed;
-    'stream: loop {
-        let line = tokio::select! {
-            changed = controls.recv() => {
-                let Some(change) = changed else { break; };
-                session.changing.store(true, Ordering::SeqCst);
-                let _changing = Changing(&session.changing);
-                if session.turn.lock().unwrap().is_some() {
-                    let _ = change.done.send(Err("Wait for Claude to finish before changing the model or effort.".into()));
-                    continue;
-                }
-                let before = session.config();
-                let mut after = before.clone();
-                if let Some(row) = after.iter_mut().find(|row| row.category == change.category) {
-                    if let Some(available) = change.available.iter().find(|row| row.category == change.category) { row.options = available.options.clone(); }
-                    if !row.options.iter().any(|choice| choice.value == change.value) {
-                        let _ = change.done.send(Err("This model or effort is no longer available.".into())); continue;
-                    }
-                    row.value = change.value;
-                } else { let _ = change.done.send(Err("This setting is not available for Claude.".into())); continue; }
-                *session.config.lock().unwrap() = after.clone();
-                send(channel, ChatEvent::Activity { phase: "Applying Claude settings".into() });
-                match start_over(&mut child, session, &|| launch(has_transcript)).await {
-                    Ok(stdout) => { lines = BufReader::new(stdout).lines(); resumed = has_transcript; let _ = change.done.send(Ok(after)); }
-                    Err(error) => { *session.config.lock().unwrap() = before; let _ = change.done.send(Err(error)); break; }
-                }
-                continue;
-            },
-            result = lines.next_line() => match result { Ok(Some(line)) => line, _ => break },
-        };
+    'stream: while let Ok(Some(line)) = lines.next_line().await {
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -840,7 +750,7 @@ async fn read_stream(
                         && !stopped
                         && text.contains(LOST_SESSION)
                     {
-                        let note = match start_over(&mut child, session, &|| launch(false)).await {
+                        let note = match start_over(&mut child, session, &fresh).await {
                             Ok(stdout) => {
                                 lines = BufReader::new(stdout).lines();
                                 RESTORE_FAILED.to_string()
@@ -870,14 +780,11 @@ async fn read_stream(
                         };
                         send(channel, ChatEvent::Note { text });
                     }
-                    has_transcript = true;
-                    session.pipe.lock().await.unanswered = None;
                     finish(session, Ok(stop));
                 }
             }
         }
     }
-    session.signal(libc::SIGTERM);
     let code = child
         .wait()
         .await
@@ -913,13 +820,7 @@ async fn start_over(
 ) -> Result<tokio::process::ChildStdout, String> {
     let mut pipe = session.pipe.lock().await;
     session.signal(libc::SIGTERM);
-    if tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
-        .await
-        .is_err()
-    {
-        session.signal(libc::SIGKILL);
-        let _ = child.wait().await;
-    }
+    let _ = child.wait().await;
     let mut next = fresh()?;
     let stdin = next.stdin.take().ok_or("Claude has no input pipe")?;
     let stdout = next.stdout.take().ok_or("Claude has no output pipe")?;
@@ -964,55 +865,51 @@ fn drain_stderr(stderr: Option<tokio::process::ChildStderr>) {
     });
 }
 
-/// Provider-reported model and effort menus, shared by native and ACP discovery.
+/// The driver's picker: the model and how hard it thinks, both passed at
+/// spawn. A model pick also switches the running child; thinking waits for
+/// the next session.
 pub(crate) fn config_rows(prefs: &PrefStore) -> Vec<ConfigRow> {
-    let mut cached = prefs.rows(AgentKind::Claude.id());
-    if !cached.iter().any(|row| row.category == "model") {
-        cached.push(ConfigRow {
-            id: "model".into(),
-            category: "model".into(),
-            name: "Model".into(),
-            value: "default".into(),
-            options: vec![ConfigChoice {
-                value: "default".into(),
-                name: "Default (chosen by Claude)".into(),
-                description: None,
-            }],
-        });
-    }
-    if !cached.iter().any(|row| row.category == "thought_level") {
-        cached.push(ConfigRow {
-            id: "effort".into(),
-            category: "thought_level".into(),
-            name: "Effort".into(),
-            value: "default".into(),
-            options: EFFORTS
-                .iter()
-                .map(|(value, name)| ConfigChoice {
-                    value: (*value).into(),
-                    name: (*name).into(),
-                    description: None,
-                })
-                .collect(),
-        });
-    }
-    cached
+    let chosen = prefs.chosen(AgentKind::Claude.id());
+    let pick = |category: &str| {
+        chosen
+            .iter()
+            .find(|(key, _)| key == category)
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| "default".into())
+    };
+    let row = |category: &str, name: &str, options: &[(&str, &str)], suggested: &str| ConfigRow {
+        id: category.into(),
+        category: category.into(),
+        name: name.into(),
+        value: pick(category),
+        options: options
+            .iter()
+            .map(|(value, label)| ConfigChoice {
+                value: (*value).into(),
+                name: (*label).into(),
+                description: (*value == suggested).then(|| "recommended".into()),
+            })
+            .collect(),
+    };
+    vec![
+        row("model", "Model", &MODELS, "fable"),
+        row("thought_level", "Thinking", &EFFORTS, "default"),
+    ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        is_current, map_line, read_stream, spawn, spawn_args, user_content, Pipe, Session, Signal,
+        is_current, map_line, read_stream, set_model_line, spawn, spawn_args, user_content, Pipe,
+        Session, Signal,
     };
     use crate::acp::Meshes;
-    use crate::prefs::{ConfigChoice, ConfigRow};
     use serde_json::Value;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicI32};
     use std::sync::{Arc, Mutex};
     use tauri::ipc::{Channel, InvokeResponseBody};
-    use tokio::sync::mpsc;
 
     const STREAM: &str = include_str!("../tests/fixtures/claude-stream.jsonl");
 
@@ -1135,8 +1032,20 @@ mod tests {
         assert!(!is_current("2.0.9"));
     }
 
+    /// The shape 2.1.316 answers with a success and the new model on the
+    /// next turn: issue #303, where the menu moved and the chat did not.
     #[test]
-    fn base_arguments_keep_the_cad_server_and_disable_unconfigured_tools() {
+    fn a_model_pick_is_a_control_request_to_the_running_child() {
+        let line = set_model_line("haiku");
+        assert_eq!(line["type"], "control_request");
+        assert_eq!(line["request"]["subtype"], "set_model");
+        assert_eq!(line["request"]["model"], "haiku");
+        assert!(line["request_id"].as_str().is_some_and(|id| !id.is_empty()));
+        assert_ne!(line["request_id"], set_model_line("haiku")["request_id"]);
+    }
+
+    #[test]
+    fn the_tools_are_the_nurb_server_and_nothing_else() {
         let args = spawn_args(
             "http://127.0.0.1:7373",
             "secret",
@@ -1189,57 +1098,15 @@ mod tests {
         let bin = dir.join("claude");
         std::fs::write(&bin, script).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let config = Arc::new(Mutex::new(vec![
-            ConfigRow {
-                id: "model".into(),
-                category: "model".into(),
-                name: "Model".into(),
-                value: "model-a".into(),
-                options: ["model-a", "model-b"]
-                    .iter()
-                    .map(|value| ConfigChoice {
-                        value: (*value).into(),
-                        name: (*value).into(),
-                        description: None,
-                    })
-                    .collect(),
-            },
-            ConfigRow {
-                id: "effort".into(),
-                category: "thought_level".into(),
-                name: "Effort".into(),
-                value: "low".into(),
-                options: ["low", "high"]
-                    .iter()
-                    .map(|value| ConfigChoice {
-                        value: (*value).into(),
-                        name: (*value).into(),
-                        description: None,
-                    })
-                    .collect(),
-            },
-        ]));
         let launch = {
-            let config = Arc::clone(&config);
             let (bin, dir) = (bin.clone(), dir.to_path_buf());
             move |resume: bool| {
-                let rows = config.lock().unwrap();
-                let args = spawn_args(
-                    "http://x",
-                    "t",
-                    "box",
-                    None,
-                    Some(&rows[0].value),
-                    Some(&rows[1].value),
-                    "sid",
-                    resume,
-                );
+                let args = spawn_args("http://x", "t", "box", None, None, None, "sid", resume);
                 spawn(&bin, args, &dir, &dir)
             }
         };
         let mut child = launch(resumed).unwrap();
         let stdout = child.stdout.take().unwrap();
-        let (controls, control_rx) = mpsc::unbounded_channel();
         let session = Arc::new(Session {
             project: dir.to_path_buf(),
             pgid: AtomicI32::new(child.id().unwrap() as i32),
@@ -1249,9 +1116,6 @@ mod tests {
             }),
             turn: Mutex::new(None),
             stopped: AtomicBool::new(false),
-            changing: AtomicBool::new(false),
-            config,
-            controls,
         });
         let seen = Arc::new(Mutex::new(Vec::new()));
         let channel = {
@@ -1268,70 +1132,13 @@ mod tests {
         let task = {
             let session = session.clone();
             tokio::spawn(async move {
-                read_stream(
-                    child, stdout, &channel, &session, "sid", resumed, control_rx, launch,
-                )
+                read_stream(child, stdout, &channel, &session, "sid", resumed, || {
+                    launch(false)
+                })
                 .await;
             })
         };
         (session, seen, task)
-    }
-
-    #[tokio::test]
-    async fn changing_native_model_and_effort_keeps_the_session_without_repeating_turns() {
-        let dir = std::env::temp_dir().join(format!("nurb-claude-config-{}", uuid::Uuid::new_v4()));
-        let script = "#!/bin/sh\nprintf '%s\\n' \"$*\" >> starts\nwhile IFS= read -r line; do printf '%s\\n' \"$line\" >> received; echo '{\"type\":\"result\",\"is_error\":false,\"result\":\"done\"}'; done\n";
-        let (session, _, task) = fake_session(&dir, script, false).await;
-        session.prompt(Value::String("first".into())).await.unwrap();
-        let available = session.config();
-        let changed = session
-            .set_config("thought_level".into(), "high".into(), available.clone())
-            .await
-            .unwrap();
-        assert_eq!(changed[1].value, "high");
-        session
-            .prompt(Value::String("second".into()))
-            .await
-            .unwrap();
-        session
-            .set_config("model".into(), "model-b".into(), available)
-            .await
-            .unwrap();
-        session.prompt(Value::String("third".into())).await.unwrap();
-        let starts = std::fs::read_to_string(dir.join("starts")).unwrap();
-        let starts: Vec<_> = starts.lines().collect();
-        assert_eq!(starts.len(), 3);
-        assert!(starts[0].contains("--session-id sid"));
-        assert!(starts[1].contains("--resume sid") && starts[1].contains("--effort high"));
-        assert!(starts[2].contains("--resume sid") && starts[2].contains("--model model-b"));
-        assert_eq!(
-            std::fs::read_to_string(dir.join("received"))
-                .unwrap()
-                .lines()
-                .count(),
-            3
-        );
-        session.signal(libc::SIGTERM);
-        task.await.unwrap();
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_busy_native_turn_refuses_setting_changes() {
-        let dir = std::env::temp_dir().join(format!("nurb-claude-busy-{}", uuid::Uuid::new_v4()));
-        let (session, _, task) = fake_session(&dir, "#!/bin/sh\ncat > received\n", false).await;
-        let (pending, _wait) = tokio::sync::oneshot::channel();
-        *session.turn.lock().unwrap() = Some(pending);
-        assert!(session
-            .set_config("thought_level".into(), "high".into(), session.config())
-            .await
-            .err()
-            .unwrap()
-            .contains("finish"));
-        assert_eq!(session.config()[1].value, "low");
-        session.signal(libc::SIGTERM);
-        task.await.unwrap();
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn notes(seen: &Mutex<Vec<Value>>) -> Vec<String> {

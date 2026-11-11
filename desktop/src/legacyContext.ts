@@ -19,7 +19,7 @@ export function legacyContext(messages: ArchiveMessage[], draft = "", limit = 60
   }
   return [
     "Continue work on this part using the current CAD tools. This is the conversation from before the upgrade:",
-    omitted ? "Recent excerpt only; older messages or part of an oversized message were omitted. The complete original remains in History and can be exported." : "",
+    omitted ? "Recent excerpt only; older messages or part of an oversized message were omitted. The complete original remains in Previous chats and can be exported." : "",
     selected.join("\n\n"),
     draft ? `Unsent draft preserved from the original conversation:\n${draft}` : "",
   ].filter(Boolean).join("\n\n");

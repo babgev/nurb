@@ -19,7 +19,6 @@ import type { BufferGeometry, Material, Object3D } from "three"
 import { OrbitControls } from "three/addons/controls/OrbitControls.js"
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js"
 import type { Finding } from "../types"
-import type { AssemblyJoint } from "./scene"
 import { duration, ease } from "../motion/tokens"
 import {
   HIGHLIGHT_OPACITY,
@@ -36,7 +35,6 @@ import {
   plate,
   plateGroup,
   printedBox,
-  poseAssembly,
   purgeBead,
   saneCamera,
   stencilWriters,
@@ -81,9 +79,6 @@ export interface ViewerIslandProps {
   /** Print-up axis of the part's coordinates. Default [0,0,1]. */
   up?: Vec3
   section?: Section | null
-  /** Assembly hinges are posed immediately while the persisted build catches up. */
-  joints?: AssemblyJoint[]
-  jointValues?: Record<string, number | boolean | string>
   /** Drawn over the canvas, each with its top-left corner on its point. */
   anchors?: ViewerAnchor[]
   /** A view to restore, taken when it can still see the part; compared by value, so a parent may re-send it freely. */
@@ -798,7 +793,6 @@ export function ViewerIsland(props: ViewerIslandProps): JSX.Element {
         if (h.ghost) part.add(h.ghost)
         h.root.add(part)
         h.part = part
-        poseAssembly(part, latest.current.joints ?? [], latest.current.jointValues ?? {})
         settle(h, latest.current.camera)
         syncPlate(h, latest.current.bed)
         tryPurge(h, latest.current.purge, purged)
@@ -830,14 +824,6 @@ export function ViewerIsland(props: ViewerIslandProps): JSX.Element {
         if (generation === h.generation) console.warn(`ViewerIsland: could not load ${glbUrl}`, error)
       })
   }, [glbUrl])
-
-  useEffect(() => {
-    const h = holderRef.current
-    if (!h?.part) return
-    poseAssembly(h.part, props.joints ?? [], props.jointValues ?? {})
-    applySection(h, latest.current.section)
-    h.render()
-  }, [props.joints, props.jointValues])
 
   const offsetKey = (targetOffset ?? [0, 0, 0]).join(",")
   useEffect(() => {

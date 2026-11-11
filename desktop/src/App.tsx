@@ -26,21 +26,13 @@ import {
   chatKey,
   markChatSeen,
   renameChatColumn,
-  renameChatSelection,
-  readChatTabs,
-  readDurableChatTabs,
-  pinChatProviders,
-  selectedChat,
-  closeChatTab,
-  migrateChatTabs,
-  CHAT_TABS_KEY,
+  renameChatKey,
+  retainChatColumns,
   updateChatActivity,
   type ChatColumn,
 } from "./chatColumns";
-import ConversationTabs from "./ConversationTabs";
-import LegacyChat from "./LegacyChat";
+import LegacyHistory from "./LegacyHistory";
 import { FORK_LABEL } from "./forkIdentity";
-import { coalescedSave } from "./coalescedSave";
 import "./fork.css";
 import EngineStarting from "./EngineStarting";
 import { createLatestRequestGate } from "./latestRequest";
@@ -145,38 +137,7 @@ function App() {
   const [dirs, setDirs] = useState<Record<string, string>>({});
 
   const [columns, setColumns] = useState<ChatColumn[]>([]);
-  const [selectedTabs, setSelectedTabs] = useState<Record<string, string>>({});
-  const [closedTabs, setClosedTabs] = useState<ChatColumn[]>([]);
-  const [tabsReady, setTabsReady] = useState(false);
-  const [migrationDone, setMigrationDone] = useState(false);
-  const [tabWrites] = useState(() => coalescedSave(
-    (state: { columns: ChatColumn[]; selected: Record<string, string>; history: ChatColumn[] }) => invoke<void>("save_chat_tabs", { state }),
-    (e) => setError(`Could not save conversations: ${String(e)}`),
-  ));
-  useEffect(() => {
-    let stale = false;
-    invoke<{ columns: ChatColumn[]; selected: Record<string, string>; history?: ChatColumn[] } | null>("load_chat_tabs").then((saved) => {
-      if (stale) return;
-      const legacy = readChatTabs(localStorage.getItem(CHAT_TABS_KEY));
-      const durable = saved ? readDurableChatTabs(saved) : null;
-      const state = durable ?? legacy;
-      const provider = localStorage.getItem("nurb-default-agent") ?? "claude";
-      setColumns(pinChatProviders(state.columns, provider));
-      setSelectedTabs(state.selected);
-      setClosedTabs(pinChatProviders(durable ? durable.history : readChatTabs(localStorage.getItem(`${CHAT_TABS_KEY}-closed`)).columns, provider));
-      setTabsReady(true);
-    }).catch((e) => setError(`Could not load saved conversations: ${String(e)}`));
-    return () => { stale = true; };
-  }, []);
-  useEffect(() => {
-    if (!tabsReady || !migrationDone) return;
-    tabWrites.update({ columns, selected: selectedTabs, history: closedTabs });
-  }, [columns, selectedTabs, closedTabs, tabsReady, migrationDone, tabWrites]);
-  useEffect(() => {
-    const flush = () => { void tabWrites.flush(); };
-    window.addEventListener("pagehide", flush);
-    return () => { window.removeEventListener("pagehide", flush); flush(); };
-  }, [tabWrites]);
+  const lastColumnId = useRef(0);
   // The folder just made, until its refetch says so itself: the chat has already
   // moved to the part, and must not vanish for the round trip.
   const [promoted, setPromoted] = useState<string | null>(null);
@@ -276,36 +237,17 @@ function App() {
     if (served) void loadProjects();
   }, [served, loadProjects]);
 
-  // Keep the original folder list and tab storage until every migration has succeeded.
+  // Import transactionally and retain the original registry and transcripts.
   useEffect(() => {
-    if (!served || !tabsReady) return;
-    let stale = false;
+    if (!served) return;
     void (async () => {
       const folders = await invoke<string[]>("take_v1_folders");
+      if (!folders.length) return;
       const refused: string[] = [];
       const count = await importV1Folders(folders, async (path) => {
         const imported = await importFolder(path, true);
         await invoke("finish_v1_import", { path, projectId: imported.id });
       }, (text) => refused.push(text));
-      const mappings = await invoke<{ path: string; projectId: string }[]>("v1_project_mappings");
-      const paths = Object.fromEntries(await Promise.all(mappings.map(async (mapping) => [mapping.path, await invoke<string>("project_dir", { projectId: mapping.projectId })])));
-      const archives = (await Promise.all(mappings.map(async (mapping) => {
-        const rows = await invoke<{ id: string; agent: string; title: string; part?: string }[]>("list_legacy_chats", { path: mapping.path });
-        return rows.map((row): ChatColumn => ({ id: `legacy:${mapping.projectId}:${row.agent}:${row.id}`, path: paths[mapping.path], part: row.part ?? PROJECT_CHAT, agent: row.agent, resume: null, unseen: false, model: row.title || row.agent, legacyPath: mapping.path, legacySession: row.id, legacyAgent: row.agent }));
-      }))).flat();
-      if (stale) return;
-      setDirs((current) => ({ ...current, ...Object.fromEntries(mappings.map((mapping) => [mapping.projectId, paths[mapping.path]])) }));
-      setColumns((list) => migrateChatTabs({ columns: list, selected: {} }, paths).columns);
-      setClosedTabs((list) => {
-        const migrated = migrateChatTabs({ columns: list, selected: {} }, paths).columns;
-        const open = migrateChatTabs({ columns, selected: {} }, paths).columns;
-        return [...migrated, ...archives.filter((archive) => ![...migrated, ...open].some((tab) => tab.legacySession === archive.legacySession && tab.legacyPath === archive.legacyPath && (tab.legacyAgent ?? tab.agent) === archive.legacyAgent))];
-      });
-      setSelectedTabs((selected) => {
-        const migrated = migrateChatTabs({ columns, selected }, paths);
-        return migrated.selected;
-      });
-      setMigrationDone(true);
       if (refused.length) setError(notBroughtOver(refused));
       await loadProjects();
       if (count) {
@@ -314,9 +256,7 @@ function App() {
         activityDone();
       }
     })().catch((e) => setError(`Could not restore the previous library: ${String(e)}`));
-    return () => { stale = true; };
-    // This migration runs once after both durable tab state and the engine are ready.
-  }, [served, tabsReady]);
+  }, [served, loadProjects, startActivity, activityDone]);
 
   const { project, missing } = useProject(served ? projectId : null);
 
@@ -332,8 +272,7 @@ function App() {
   // The mounted column is the conversation, so it goes along, running turn and all.
   const moveChat = useCallback((dir: string, was: string, name: string) => {
     setColumns((list) => renameChatColumn(list, dir, was, name));
-    setClosedTabs((list) => renameChatColumn(list, dir, was, name));
-    setSelectedTabs((map) => renameChatSelection(map, dir, was, name));
+    setBusyChats((map) => renameChatKey(map, chatKey(dir, was), chatKey(dir, name)));
   }, []);
 
   // A rename moves the part's conversation and, when it is the open part, the selection.
@@ -440,7 +379,7 @@ function App() {
 
   // One chat per conversation, mounted for as long as its turn runs.
   useEffect(() => {
-    if (!migrationDone || !projectId || !dirs[projectId]) return;
+    if (!projectId || !dirs[projectId]) return;
     const dir = dirs[projectId];
     // The last conversation picks up where it left off, under the agent that
     // ran it; a part with no saved chat starts fresh with the default.
@@ -456,31 +395,39 @@ function App() {
             : [
                 ...list,
                 {
-                  id: crypto.randomUUID(),
+                  id: ++lastColumnId.current,
                   path: dir,
                   part: chatPart,
-                  agent: saved?.agent ?? defaultAgent,
+                  agent: saved?.agent ?? null,
                   resume: saved?.sessionId ?? null,
+                  gen: 0,
                   unseen: false,
                 },
               ],
         ),
       );
-  }, [projectId, dirs, chatPart, migrationDone, defaultAgent]);
+  }, [projectId, dirs, chatPart]);
 
   const activeDir = projectId ? dirs[projectId] ?? null : null;
 
-  const visibleColumn = activeDir ? selectedChat(columns, selectedTabs, activeDir, chatPart) : undefined;
-  const visibleColumnId = screen === "workspace" ? visibleColumn?.id : undefined;
   useEffect(() => {
-    if (visibleColumnId) setColumns((list) => markChatSeen(list, visibleColumnId));
-  }, [visibleColumnId]);
+    setColumns((list) => retainChatColumns(list, activeDir, busyRef.current));
+  }, [activeDir]);
+
+  useEffect(() => {
+    // Seen means looked at, and the library is not the workspace: a turn that
+    // finished while the library was up stays unseen until the chat is on screen,
+    // or retainChatColumns would keep its adapter alive after a project switch.
+    if (activeDir && screen === "workspace") {
+      setColumns((list) => markChatSeen(list, activeDir, chatPart));
+    }
+  }, [activeDir, screen, chatPart]);
 
   useEffect(() => {
     if (ready === true) invoke<AboutInfo>("about_info").then(setAbout).catch(() => {});
   }, [ready]);
   const checkUpdatesNow = useCallback(async () => {
-    await message("This is Nurb Fork. Updates are installed from the fork so your custom features remain available.", { title: "Nurb Fork" });
+    await message("Nurb Fork updates are installed from the fork to preserve browser access.", { title: "Nurb Fork" });
   }, []);
   useEffect(() => {
     const unlisten = listen("menu:check-updates", () => void checkUpdatesNow());
@@ -514,8 +461,6 @@ function App() {
   }, [ready, refreshAgents]);
 
   const chooseAgent = (id: string) => {
-    setColumns((list) => pinChatProviders(list, defaultAgent));
-    setClosedTabs((list) => pinChatProviders(list, defaultAgent));
     setDefaultAgent(id);
     localStorage.setItem("nurb-default-agent", id);
   };
@@ -560,7 +505,7 @@ function App() {
       if (folderId) {
         const folder = await fetchProject(folderId);
         const dir = dirs[folderId];
-        const running = dir ? columns.some((col) => col.path === dir && col.part === NEW_PART && busyRef.current[col.id]) : false;
+        const running = dir ? busyRef.current[chatKey(dir, NEW_PART)] : false;
         if (!running) {
           await invoke("select_part_chat", { projectId: folderId, part: NEW_PART, sessionId: null });
           setColumns((list) => list.filter((col) => !(col.path === dir && col.part === NEW_PART)));
@@ -604,7 +549,7 @@ function App() {
   useEffect(() => {
     if (!draft?.landed) return;
     const dir = dirs[draft.projectId];
-    if (!dir || columns.some((col) => col.path === dir && col.part === NEW_PART && busyChats[col.id])) return;
+    if (!dir || busyChats[chatKey(dir, NEW_PART)]) return;
     const { projectId: folderId, landed: name, after } = draft;
     setDraft(null);
     claimMessages(folderId, name, after).catch((e) => setError(String(e)));
@@ -743,54 +688,53 @@ function App() {
     };
   }, [served, loadProjects, selectProject, runImport, openPart]);
 
-  const startFresh = (path: string, part: string, agent = defaultAgent, draft?: ChatColumn["draft"], config?: ChatColumn["config"]): Promise<boolean> => {
-    const id = crypto.randomUUID();
-    setColumns((list) => [...list, { id, path, part, agent, resume: null, draft, config, unseen: false }]);
-    setSelectedTabs((map) => ({ ...map, [chatKey(path, part)]: id }));
-    return Promise.resolve(true);
+  const startFresh = async (path: string, part: string, agent: string | null = null) => {
+    if (!projectId) return;
+    try {
+      await invoke("select_part_chat", { projectId, part, sessionId: null });
+    } catch (e) {
+      setError(String(e));
+      return;
+    }
+    setColumns((list) =>
+      list.map((col) =>
+        col.path === path && col.part === part
+          ? { ...col, resume: null, agent, gen: col.gen + 1 }
+          : col,
+      ),
+    );
   };
-  const updateTab = (id: string, patch: Partial<ChatColumn>) => setColumns((list) => list.map((col) => col.id === id && !Object.entries(patch).every(([key, value]) => JSON.stringify(col[key as keyof ChatColumn]) === JSON.stringify(value)) ? { ...col, ...patch } : col));
-  const closeTab = (id: string) => {
-    if (busyRef.current[id]) { setError("Stop the agent before closing this tab."); return; }
-    const closing = columns.find((col) => col.id === id);
-    if (!closing) return;
-    const next = closeChatTab({ columns, selected: selectedTabs }, id, crypto.randomUUID());
-    setClosedTabs((list) => [...list.filter((col) => col.id !== id), closing]);
-    setColumns(next.columns);
-    setSelectedTabs(next.selected);
+
+  const chatStarted = (path: string, part: string, id: string, agent: string) => {
+    if (projectId) {
+      invoke("select_part_chat", { projectId, part, sessionId: id }).catch((e) =>
+        setError(String(e)),
+      );
+    }
+    setColumns((list) =>
+      list.map((col) =>
+        col.path === path && col.part === part ? { ...col, resume: id, agent } : col,
+      ),
+    );
   };
-  const closeActiveTab = useRef(() => {});
-  closeActiveTab.current = () => { if (visibleColumnId) closeTab(visibleColumnId); };
-  useEffect(() => {
-    const unlisten = listen("menu:close-tab", () => closeActiveTab.current());
-    return () => { unlisten.then((fn) => fn()).catch(() => {}); };
-  }, []);
-  const reopenTab = (id: string) => {
-    const tab = closedTabs.find((col) => col.id === id);
-    if (!tab) return;
-    setColumns((list) => [...list, tab]);
-    setClosedTabs((list) => list.filter((col) => col.id !== id));
-    setSelectedTabs((map) => ({ ...map, [chatKey(tab.path, tab.part)]: id }));
+
+  const chatBusy = (
+    path: string,
+    part: string,
+    agent: string,
+    busy: boolean,
+    visible: boolean,
+  ) => {
+    const key = chatKey(path, part);
+    const wasBusy = Boolean(busyRef.current[key]);
+    setBusyChats((map) => {
+      if (busy) return { ...map, [key]: true };
+      if (!(key in map)) return map;
+      const { [key]: _, ...rest } = map;
+      return rest;
+    });
+    setColumns((list) => updateChatActivity(list, path, part, agent, busy, visible, wasBusy));
   };
-  const chatStarted = (col: ChatColumn, id: string, agent: string) => {
-    const owningProject = Object.entries(dirs).find(([, dir]) => dir === col.path)?.[0];
-    if (owningProject) invoke("select_part_chat", { projectId: owningProject, part: col.part, sessionId: id }).catch((e) => setError(String(e)));
-    updateTab(col.id, { resume: id, agent });
-  };
-  const chatBusy = (id: string, agent: string, busy: boolean, visible: boolean) => {
-    const wasBusy = Boolean(busyRef.current[id]);
-    const next = { ...busyRef.current };
-    if (busy) next[id] = true; else delete next[id];
-    busyRef.current = next;
-    setBusyChats(next);
-    setColumns((list) => updateChatActivity(list, id, agent, busy, visible, wasBusy));
-  };
-  const tabBar = (col: ChatColumn) => <ConversationTabs
-    tabs={columns.filter((tab) => tab.path === col.path && tab.part === col.part)} selected={col.id}
-    busy={busyChats} closed={closedTabs.filter((tab) => tab.path === col.path && tab.part === col.part)}
-    onSelect={(id) => setSelectedTabs((map) => ({ ...map, [chatKey(col.path, col.part)]: id }))}
-    onClose={closeTab} onNew={() => { void startFresh(col.path, col.part, col.agent ?? defaultAgent, undefined, col.config); }} onReopen={reopenTab}
-  />;
 
   // Three screens stand in front of the app, and each one hands over rather than
   // cutting: the window dissolves from setup, to the engine starting, to the app.
@@ -877,27 +821,21 @@ function App() {
                 <span className="mono-label">Library</span>
               </button>
             ),
-            end: <div className="flex items-center gap-2"><span className="mono-caption text-muted">{FORK_LABEL}</span><IconButton icon="gear" label="Settings" onClick={() => setSettingsSection("agents")} /></div>,
+            end: <div className="flex items-center gap-3">
+              <span className="mono-caption text-muted">{FORK_LABEL}</span>
+              {projectId && <LegacyHistory projectId={projectId} part={chatPart} onContinue={(text) => setComposerSeed({ projectId, part: chatPart, text })} />}
+              <IconButton icon="gear" label="Settings" onClick={() => setSettingsSection("agents")} />
+            </div>,
           }}
           chat={
             <>
-              {migrationDone && columns.filter((col) => Object.values(dirs).includes(col.path)).map((col) => {
+              {columns.map((col) => {
                 const agent = col.agent ?? defaultAgent;
                 const visible =
-                  col.id === visibleColumnId;
-                if (col.legacySession && col.legacyPath) return <LegacyChat key={col.id} tab={col} hidden={!visible} tabBar={tabBar(col)} onContinue={(text) => { void startFresh(col.path, col.part, agent, { text, files: col.draft?.files ?? [] }, col.config); }} />;
+                  col.path === activeDir && col.part === chatPart && screen === "workspace";
                 return (
                   <Chat
-                    key={col.id}
-                    tabId={col.id}
-                    tabBar={tabBar(col)}
-                    draft={col.draft}
-                    initialConfig={col.config}
-                    initialItems={col.transcript}
-                    onItems={(transcript) => updateTab(col.id, { transcript })}
-                    onDraft={(draft) => updateTab(col.id, { draft })}
-                    onConfig={(config) => updateTab(col.id, { config })}
-                    onModel={(model) => updateTab(col.id, { model })}
+                    key={`${col.id}:${col.gen}:${agent}`}
                     path={col.path}
                     part={col.part}
                     // A folder's own conversation speaks of the folder; every
@@ -941,10 +879,13 @@ function App() {
                         : null
                     }
                     onSeed={() => setComposerSeed(null)}
-                    onSession={(id) => chatStarted(col, id, agent)}
-                    onFresh={() => { void startFresh(col.path, col.part, agent, undefined, col.config); }}
-                    onAgent={(id, unstarted, draft, model) => { if (unstarted) chooseAgent(id); return startFresh(col.path, col.part, id, draft, { model }); }}
-                    onBusy={(busy) => chatBusy(col.id, agent, busy, visible)}
+                    onSession={(id) => chatStarted(col.path, col.part, id, agent)}
+                    onFresh={() => startFresh(col.path, col.part)}
+                    onAgent={(id, unstarted) => {
+                      if (unstarted) chooseAgent(id);
+                      startFresh(col.path, col.part, id);
+                    }}
+                    onBusy={(busy) => chatBusy(col.path, col.part, agent, busy, visible)}
                     onSignIn={signInAgent}
                   />
                 );
@@ -962,7 +903,7 @@ function App() {
           projectId={projectId}
           updateReady={false}
           updateCard={null}
-          onShowUpdate={() => void checkUpdatesNow()}
+          onShowUpdate={() => {}}
           importing={importing}
           error={libraryError ?? error}
           onSelectProject={selectProject}

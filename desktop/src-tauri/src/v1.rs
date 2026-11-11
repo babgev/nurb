@@ -561,7 +561,7 @@ pub async fn read_legacy_chat(
         if fs::metadata(&chat.file).map_err(|e| e.to_string())?.len() > MAX_TRANSCRIPT { return Err("This transcript is too large to display. The original file is still retained in the provider's session store.".into()); }
         let raw = fs::read_to_string(&chat.file).map_err(|e| e.to_string())?;
         let records = if agent == "gemini" { serde_json::from_str::<Value>(&raw).ok().and_then(|v| v.get("messages").and_then(Value::as_array).cloned()).unwrap_or_default() } else { raw.lines().filter_map(|l| serde_json::from_str(l).ok()).collect() };
-        Ok(LegacyTranscript { messages: messages(&records, &agent), raw, note: "Archived from Nurb Fork 0.x. The original conversation is preserved read-only. Continue in a new tab to work with the upgraded project tools.".into() })
+        Ok(LegacyTranscript { messages: messages(&records, &agent), raw, note: "Archived from Nurb Fork 0.x. The original conversation is preserved read-only. Add recent context to your draft to work with the upgraded project tools.".into() })
     }).await.map_err(|e| e.to_string())?
 }
 

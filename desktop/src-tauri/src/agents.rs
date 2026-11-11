@@ -13,28 +13,8 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
-
-// The shipped manifest also drives development's npx pins, so an adapter update
-// cannot leave the packaged and development apps running different versions.
-static ADAPTER_PINS: LazyLock<std::collections::HashMap<String, String>> = LazyLock::new(|| {
-    #[derive(serde::Deserialize)]
-    struct Manifest {
-        dependencies: std::collections::HashMap<String, String>,
-    }
-    let manifest: Manifest =
-        serde_json::from_str(include_str!("../../adapter-runtime/package.json"))
-            .expect("the bundled adapter manifest must be valid");
-    manifest
-        .dependencies
-        .into_iter()
-        .map(|(package, version)| {
-            let pin = format!("{package}@{version}");
-            (package, pin)
-        })
-        .collect()
-});
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AgentKind {
@@ -88,29 +68,23 @@ impl AgentKind {
         }
     }
 
-    /// Exact adapter pins from the bundled manifest. None for ACP-native CLIs.
+    /// Exact adapter pins for the adapter-hosted agents; both projects
+    /// release weekly, so no ranges. None for the ACP-native CLIs.
     pub fn adapter(self) -> Option<&'static str> {
-        let package = match self {
-            Self::Claude => "@agentclientprotocol/claude-agent-acp",
-            Self::Codex => "@agentclientprotocol/codex-acp",
-            Self::Gemini => "@google/gemini-cli",
-            Self::Cursor | Self::Grok => return None,
-        };
-        Some(
-            ADAPTER_PINS
-                .get(package)
-                .expect("agent missing from bundled manifest"),
-        )
+        match self {
+            Self::Codex => Some("@agentclientprotocol/codex-acp@2.5.0"),
+            Self::Gemini => Some("@google/gemini-cli@0.66.0"),
+            Self::Claude | Self::Cursor | Self::Grok => None,
+        }
     }
 
     /// The executable name npm installs for the adapter, for spawning it out
     /// of the provisioned runtime without npx.
     pub fn adapter_bin(self) -> Option<&'static str> {
         match self {
-            Self::Claude => Some("claude-agent-acp"),
             Self::Codex => Some("codex-acp"),
             Self::Gemini => Some("gemini"),
-            Self::Cursor | Self::Grok => None,
+            Self::Claude | Self::Cursor | Self::Grok => None,
         }
     }
 
@@ -143,12 +117,7 @@ impl AgentKind {
             Self::Codex | Self::Gemini => return None,
         };
         let home = PathBuf::from(std::env::var("HOME").ok()?);
-        find_bin(
-            name,
-            &home,
-            install_dirs,
-            Some(crate::env::user_path().into()),
-        )
+        find_bin(name, &home, install_dirs, Some(crate::env::user_path().into()))
     }
 
     /// What a signed-out user needs, in the pane and the chat column.
@@ -265,8 +234,7 @@ fn driver_auth_status() -> (Option<bool>, Option<String>) {
     let Ok(output) = Command::new(bin)
         .args(["auth", "status", "--json"])
         .env("PATH", crate::env::user_path())
-        .output()
-    else {
+        .output() else {
         return (None, None);
     };
     let parsed = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok();
@@ -372,8 +340,7 @@ fn cursor_auth_status(kind: AgentKind) -> (Option<bool>, Option<String>) {
     let Ok(output) = Command::new(bin)
         .arg("status")
         .env("PATH", crate::env::user_path())
-        .output()
-    else {
+        .output() else {
         return (None, None);
     };
     let text = String::from_utf8_lossy(&output.stdout);
@@ -518,20 +485,12 @@ mod tests {
         assert!(AgentKind::parse("unknown").is_err());
     }
 
-    /// Claude chats use the native CLI while its adapter only discovers the
-    /// account's versioned model menu. Other agents have one launch route.
+    /// Every agent starts one way or the other, never both: an npm adapter
+    /// the app provisions, or a native CLI the app only finds.
     #[test]
-    fn every_agent_has_a_chat_route_and_claude_also_has_metadata_discovery() {
+    fn each_agent_is_adapter_hosted_or_native() {
         for agent in super::ALL {
-            if agent == AgentKind::Claude {
-                assert_eq!(
-                    agent.native_command().map(|(command, _)| command),
-                    Some("claude")
-                );
-                assert!(agent.adapter().is_some());
-            } else {
-                assert_eq!(agent.adapter().is_some(), agent.native_command().is_none());
-            }
+            assert_eq!(agent.adapter().is_some(), agent.native_command().is_none());
             assert_eq!(agent.adapter().is_some(), agent.adapter_bin().is_some());
         }
     }
@@ -551,10 +510,6 @@ mod tests {
             let (package, version) = adapter.rsplit_once('@').unwrap();
             assert_eq!(manifest["dependencies"][package], version);
             assert_eq!(locked[package], version);
-            assert_eq!(
-                lock["packages"][format!("node_modules/{package}")]["version"],
-                version
-            );
         }
     }
 
@@ -589,12 +544,7 @@ mod tests {
         std::fs::write(brew.join("claude"), b"").unwrap();
         let path = format!("/usr/bin:{}", brew.display());
         assert_eq!(
-            super::find_bin(
-                "claude",
-                &home,
-                &[".local/bin", ".claude/local"],
-                Some(path.into())
-            ),
+            super::find_bin("claude", &home, &[".local/bin", ".claude/local"], Some(path.into())),
             Some(brew.join("claude"))
         );
         std::fs::remove_dir_all(root).unwrap();

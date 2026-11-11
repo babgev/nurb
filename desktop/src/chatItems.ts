@@ -9,7 +9,6 @@ export type PermissionOption = { optionId: string; name: string; kind: string };
 
 // Mirrors ChatEvent in src-tauri/src/acp.rs.
 export type ChatEvent =
-  | { type: "activity"; phase: string }
   | { type: "user_text"; text: string }
   | { type: "agent_text"; text: string }
   | { type: "agent_thought"; text: string }
@@ -224,16 +223,13 @@ export function applyChatEvent(items: Item[], event: ChatEvent, at: number, seq 
         { kind: "step", toolKind: event.kind, tool: event.title, seq, step: stepFrom(event, at) },
       ];
     case "tool_call_update": {
-      if (!items.some((item) => item.kind === "step" && item.step.id === event.id)) {
-        return [...items, { kind: "step", tool: event.title ?? "Tool activity", seq, step: stepFrom({ ...event, type: "tool_call", title: event.title ?? "Tool activity", status: event.status ?? "pending" }, at) }];
-      }
       const next: Item[] = [];
       for (const item of items) {
         if (item.kind !== "step" || item.step.id !== event.id) {
           next.push(item);
           continue;
         }
-        next.push({ ...item, tool: event.title ?? item.tool, step: advanceStep(item.step, event, at, item.toolKind) });
+        next.push({ ...item, step: advanceStep(item.step, event, at, item.toolKind) });
       }
       return next;
     }

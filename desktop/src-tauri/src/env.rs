@@ -67,7 +67,7 @@ impl Launcher {
     /// than through the .bin shebang, which would resolve whatever node `env`
     /// finds on PATH.
     pub fn adapter(&self, kind: AgentKind) -> (String, Vec<String>) {
-        if let Some((name, args)) = kind.native_command().filter(|_| kind != AgentKind::Claude) {
+        if let Some((name, args)) = kind.native_command() {
             let program = kind
                 .native_bin()
                 .map(|bin| bin.to_string_lossy().into_owned())

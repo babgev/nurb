@@ -78,15 +78,3 @@ export declare function glowOutline(face: number[], plane: Plane, pal: Palette):
 export declare function pinMesh(where: [number, number, number], severity: Severity, scale: number, pal: Palette): Mesh;
 /** The ghost's geometry is not ours to drop, so a child named `target` is skipped (v1:1904). */
 export declare function disposeGroup(group: Object3D): void;
-export interface AssemblyJoint {
-    node: string;
-    param: string | null;
-    name: string;
-    origin: [number, number, number];
-    dir: [number, number, number];
-    lo: number;
-    hi: number;
-    at: number;
-}
-/** Pose against the loaded geometry, never against the previous slider tick. */
-export declare function poseAssembly(group: Group, joints: AssemblyJoint[], values: Record<string, number | boolean | string>): void;

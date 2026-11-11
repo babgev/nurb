@@ -256,10 +256,7 @@ mod tests {
     }
 }
 
-// Tab state has grown to include transcripts. Keep it out of the webview's small
-// localStorage quota, and leave the old key untouched as a migration backup.
-static TAB_WRITE: Mutex<()> = Mutex::new(());
-
+// Read earlier fork tab storage only for the archive viewer. Never rewrite it.
 #[tauri::command]
 pub fn load_chat_tabs(
     data: tauri::State<crate::AppData>,
@@ -273,20 +270,4 @@ pub fn load_chat_tabs(
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(|e| format!("Saved tabs could not be read; the original file is unchanged: {e}"))
-}
-
-#[tauri::command]
-pub fn save_chat_tabs(
-    data: tauri::State<crate::AppData>,
-    state: serde_json::Value,
-) -> Result<(), String> {
-    if !state.is_object()
-        || !state
-            .get("columns")
-            .is_some_and(serde_json::Value::is_array)
-    {
-        return Err("Conversation tab state must include its columns".into());
-    }
-    let _guard = TAB_WRITE.lock().map_err(|e| e.to_string())?;
-    crate::v1::private_json(&data.0.join("chat-tabs-v2.json"), &state)
 }

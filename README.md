@@ -1,6 +1,6 @@
 # Nurb Fork
 
-This is [babgev/nurb](https://github.com/babgev/nurb), a fork of [Shpigford/nurb](https://github.com/Shpigford/nurb). The original authors, license, and CAD engine are preserved. Fork builds use the stable `io.github.babgev.nurb` app identity and do not install upstream desktop updates.
+This is [babgev/nurb](https://github.com/babgev/nurb), a fork of [Shpigford/nurb](https://github.com/Shpigford/nurb). It follows upstream’s chat and provider-switching interface, with configurable Browser MCP access. The original authors, license, and CAD engine are preserved. Fork builds use the stable `io.github.babgev.nurb` app identity and do not install upstream desktop updates.
 
 Tell your AI what you need printed. Watch the part take shape live. Print it.
 
@@ -107,9 +107,9 @@ def hose_adapter(vac_end=57.6, tool_end=35.0, wall=2.4):
 
 1.0 is the app. The `nurb` command line, the skill file and the PyPI package are gone: a project now lives in a database on your computer instead of a folder of files, which is what gives every part its revision history and keeps the app and the agent from overwriting each other. Your old projects come across on their own the first time 1.0 opens (**Import folder** brings over any that don't), and an agent in your terminal reaches the same parts through **Settings > Connect**.
 
-Legacy conversations remain available in the fork's history as archives. The new engine starts fresh agent sessions because the old sessions refer to the previous folder-based tools. Claude now runs through an installed Claude Code CLI; the bundled ACP adapter still supplies versioned model choices. The app shows how to install and sign in to Claude Code when it is missing.
+Legacy conversations and unsent drafts remain available under Previous chats as archives. The new engine starts fresh agent sessions because the old sessions refer to the previous folder-based tools. Claude now runs through an installed Claude Code CLI; model selection follows upstream’s native provider menus. The app shows how to install and sign in to Claude Code when it is missing.
 
-This fork restores the assembly hinge controls. Other older tools remain absent from the upstream redesign: the stress button, dedicated phone-scan and target-mesh workflows, the section plane, and card variants.
+Older tools absent from the upstream redesign remain absent here, including the assembly hinge slider, the stress button, dedicated phone-scan and target-mesh workflows, the section plane, and card variants.
 
 ## Contributing
 

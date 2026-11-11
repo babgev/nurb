@@ -1,7 +1,6 @@
 import { JSX, ReactNode } from 'react';
 import { Object3D } from 'three';
 import { Finding } from '../types';
-import { AssemblyJoint } from './scene';
 export type Vec3 = [number, number, number];
 export interface CameraState {
     position: Vec3;
@@ -40,9 +39,6 @@ export interface ViewerIslandProps {
     /** Print-up axis of the part's coordinates. Default [0,0,1]. */
     up?: Vec3;
     section?: Section | null;
-    /** Assembly hinges are posed immediately while the persisted build catches up. */
-    joints?: AssemblyJoint[];
-    jointValues?: Record<string, number | boolean | string>;
     /** Drawn over the canvas, each with its top-left corner on its point. */
     anchors?: ViewerAnchor[];
     /** A view to restore, taken when it can still see the part; compared by value, so a parent may re-send it freely. */

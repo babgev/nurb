@@ -555,11 +555,8 @@ export default function PartView({
   // Instead of, not as well as: a pinned dimension listed above and offered as a
   // slider below would be the same number twice, and only one of them locked.
   const draggable = useMemo<Param[]>(
-    () => (part?.params ?? []).filter((p) => !locked.has(p.name)).map((param) => {
-      const joint = build?.stats.joints?.find((joint) => joint.param === param.name)
-      return joint ? { ...param, min: joint.lo, max: joint.hi, step: 1, description: `${joint.name} angle in degrees` } : param
-    }),
-    [part?.params, locked, build?.stats.joints]
+    () => (part?.params ?? []).filter((p) => !locked.has(p.name)),
+    [part?.params, locked]
   )
 
   const counts = useMemo(() => {
@@ -699,8 +696,6 @@ export default function PartView({
             key={part?.id}
             glbUrl={absolute(glbUrl)}
             findings={findings}
-            joints={build?.stats.joints}
-            jointValues={values}
             highlight={highlight}
             onHighlight={setHighlight}
             onPick={pointing || labelling ? onPick : null}

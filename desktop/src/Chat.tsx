@@ -27,25 +27,28 @@ import {
   Icon,
   IconButton,
   MeasurementCard,
+  Menu,
   NewItemsPill,
   SpecCard,
   cue,
+  type MenuItem,
   type Message,
 } from "@nurb/ui";
 import { addMessage } from "@nurb/workbench/api";
 import {
+  activity,
   applyChatEvent,
   claudeNote,
   describe,
   type ChatEvent,
   type Item,
   type PermissionOption,
+  pruneLanded,
   withNote,
 } from "./chatItems";
-import { AttachmentDraft, restoreDraftText, stashDraft, unstashDraft } from "./chatDraft";
-import ModelPicker, { type ConfigRow } from "./ModelPicker";
 import McpPanel from "./McpPanel";
-import { activityStatus, elapsedLabel } from "./chatActivity";
+import { AttachmentDraft, restoreDraftText, stashDraft, unstashDraft } from "./chatDraft";
+import { chatKey } from "./chatColumns";
 
 // The whole-project conversation rides the per-part plumbing under a name no part
 // file can have. Twins live in App.tsx's mount and acp.rs's context line.
@@ -56,6 +59,19 @@ export const NEW_PART = "//new";
 
 type Permission = { id: number; title: string; options: PermissionOption[] };
 
+// Mirrors ConfigRow in src-tauri/src/prefs.rs: the model and effort selects,
+// as the agent itself describes them.
+type ConfigChoice = { value: string; name: string; description?: string };
+type ConfigRow = {
+  id: string;
+  // "model" or "thought_level": the key the app addresses a row by, since the
+  // agents name the options themselves differently.
+  category: string;
+  name: string;
+  value: string;
+  options: ConfigChoice[];
+};
+
 // Mirrors AgentKind::label in src-tauri/src/agents.rs.
 export const AGENT_LABEL: Record<string, string> = {
   claude: "Claude",
@@ -65,7 +81,19 @@ export const AGENT_LABEL: Record<string, string> = {
   grok: "Grok",
 };
 
+// The agents name these rows differently (Codex says "Reasoning effort"); the
+// menu says one thing for one idea.
+const SECTION_LABEL: Record<string, string> = { model: "Model", thought_level: "Thinking" };
+
 const basename = (path: string) => path.split("/").pop() ?? path;
+
+// The button's own label: the selected names, not the model ids, since those
+// are the agent's wire values and mean nothing to someone printing a bracket.
+function summarize(config: ConfigRow[]): string {
+  return config
+    .map((row) => row.options.find((o) => o.value === row.value)?.name ?? row.value)
+    .join(" · ");
+}
 
 // A plan entry reads by its state alone, so the three states stay separable
 // without a legend.
@@ -189,12 +217,12 @@ function Stored({ message, who, n }: { message: Message; who: string; n?: string
 }
 
 function Chat({
-  tabId, tabBar, draft, initialConfig, initialItems, onDraft, onConfig, onModel, onItems,
   path,
   part,
   subject,
   wholeProject,
   messages,
+  landed,
   agent,
   agents,
   resume,
@@ -202,19 +230,11 @@ function Chat({
   seed,
   onSeed,
   onSession,
+  onFresh,
   onAgent,
   onBusy,
   onSignIn,
 }: {
-  tabId: string;
-  tabBar?: ReactNode;
-  draft?: { text: string; files: string[] };
-  initialConfig?: Record<string, string>;
-  initialItems?: Item[];
-  onDraft?: (draft: { text: string; files: string[] }) => void;
-  onConfig?: (values: Record<string, string>) => void;
-  onModel?: (model: string) => void;
-  onItems?: (items: Item[]) => void;
   path: string;
   // The project's own transcript, which outlives any one conversation. Hidden
   // columns are handed an empty list, since only the selected project loads one.
@@ -247,7 +267,7 @@ function Chat({
   // Switching agents cannot move a conversation across two different session
   // stores, so it starts a fresh one on the agent picked. `unstarted` is true
   // when nothing has been said yet, which makes the pick the new default.
-  onAgent: (id: string, unstarted: boolean, draft: { text: string; files: string[] }, model: string) => Promise<boolean>;
+  onAgent: (id: string, unstarted: boolean) => void;
   onBusy: (busy: boolean) => void;
   onSignIn: (agent: string) => Promise<boolean>;
 }) {
@@ -271,7 +291,7 @@ function Chat({
   const isClaude = agent === "claude";
   // The folder's last segment is the project's id in the store.
   const projectId = path.split("/").filter(Boolean).pop() ?? "";
-  const [items, setItems] = useState<Item[]>(initialItems ?? []);
+  const [items, setItems] = useState<Item[]>([]);
   const [busy, setBusy] = useState(false);
   // A resumed transcript starts loading after the first paint, so treat it as
   // starting immediately rather than briefly exposing a live composer.
@@ -281,7 +301,7 @@ function Chat({
   const [signingIn, setSigningIn] = useState(false);
   const [permissions, setPermissions] = useState<Permission[]>([]);
   // Absolute paths; the Rust side reads them at send time.
-  const [attachments, setAttachments] = useState<string[]>(draft?.files ?? []);
+  const [attachments, setAttachments] = useState<string[]>([]);
   const refusalRef = useRef<string | null>(null);
   // Stop can land before the prompt has gone out, while the files are checked or
   // the session starts. There is nothing to interrupt yet, so the send stands down.
@@ -289,7 +309,7 @@ function Chat({
   const promptingRef = useRef(false);
   const attachmentDraftRef = useRef<AttachmentDraft | null>(null);
   if (!attachmentDraftRef.current) {
-    attachmentDraftRef.current = new AttachmentDraft(setAttachments, draft?.files ?? []);
+    attachmentDraftRef.current = new AttachmentDraft(setAttachments);
   }
   const attachmentDraft = attachmentDraftRef.current;
   const [dropping, setDropping] = useState(false);
@@ -305,51 +325,18 @@ function Chat({
   const gridfinityAt = useRef(0);
   // The project's transcript in the order it was written, then whatever this
   // turn has produced that has not reached the store yet.
-  // CAD specs and measurement changes belong to the shared part. Spoken turns
-  // stay in their own tab, even when another agent edits that same part.
-  const ordered = messages.filter((message) => message.payload?.type === "spec" || message.payload?.type === "measurement").sort((a, b) => (a.sequence_number ?? 0) - (b.sequence_number ?? 0));
+  const ordered = [...messages].sort((a, b) => (a.sequence_number ?? 0) - (b.sequence_number ?? 0));
   const said = messages.length > 0 || items.length > 0;
   // The newest stored row, read at event time so a step remembers where the
   // transcript stood when it was called.
   const seqRef = useRef(0);
   seqRef.current = messages.reduce((top, m) => Math.max(top, m.sequence_number ?? 0), 0);
+  useEffect(() => {
+    setItems((list) => pruneLanded(list, landed ?? messages));
+  }, [landed, messages]);
   // The model and effort this conversation runs on. Empty before the agent has
   // ever reported its lists, which is only ever the first chat on this Mac.
   const [config, setConfig] = useState<ConfigRow[]>([]);
-  const choicesRef = useRef<Record<string, string>>({ ...initialConfig });
-  const [providerConfigs, setProviderConfigs] = useState<Record<string, ConfigRow[]>>({});
-  const [providerLoading, setProviderLoading] = useState<Record<string, boolean>>({});
-  const [providerErrors, setProviderErrors] = useState<Record<string, string | null>>({});
-  const [configuring, setConfiguring] = useState(false);
-  const [configError, setConfigError] = useState<string | null>(null);
-  const configuringRef = useRef(false);
-  const configRequestsRef = useRef<Record<string, number>>({});
-  const discoveryRef = useRef(new Set<string>());
-  const discoveryStartedRef = useRef(false);
-  const providerIds = agents.map((option) => option.id).join(",");
-  const startupIdRef = useRef<string | null>(null);
-  const [cancelling, setCancelling] = useState(false);
-  const [lastEventAt, setLastEventAt] = useState(Date.now());
-  const [turnStartedAt, setTurnStartedAt] = useState(Date.now());
-  const [clock, setClock] = useState(Date.now());
-  const [phase, setPhase] = useState("");
-  const callbacks = useRef({ onDraft, onConfig, onModel, onItems });
-  callbacks.current = { onDraft, onConfig, onModel, onItems };
-  useEffect(() => { callbacks.current.onItems?.(items); }, [items]);
-  useEffect(() => {
-    callbacks.current.onDraft?.({ text: inputRef.current?.value ?? draft?.text ?? "", files: attachments });
-  }, [attachments]);
-  useEffect(() => {
-    if (!config.length) return;
-    callbacks.current.onConfig?.(Object.fromEntries(config.map((row) => [row.category, row.value])));
-    const model = config.find((row) => row.category === "model");
-    if (model) callbacks.current.onModel?.(model.options.find((option) => option.value === model.value)?.name ?? model.value);
-  }, [config]);
-  useEffect(() => {
-    if (!busy && !starting) return;
-    const timer = setInterval(() => setClock(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, [busy, starting]);
   const sessionRef = useRef<string | null>(null);
   // The part named in a Claude session's system prompt, which cannot change once
   // the process is up. Older than `part` after a rename.
@@ -377,7 +364,6 @@ function Chat({
     box.style.height = "auto";
     box.style.height = `${box.scrollHeight}px`;
     setEmpty(box.value.trim().length === 0);
-    callbacks.current.onDraft?.({ text: box.value, files: attachmentDraft.current });
   };
   // Latest callbacks behind stable refs so ensureSession never goes stale.
   const onSessionRef = useRef(onSession);
@@ -398,7 +384,6 @@ function Chat({
     return () => {
       closedRef.current = true;
       const session = sessionRef.current;
-      if (startupIdRef.current) invoke("cancel_chat_start", { startupId: startupIdRef.current }).catch(() => {});
       sessionRef.current = null;
       if (session) invoke("close_chat", { sessionId: session }).catch(() => {});
     };
@@ -449,16 +434,16 @@ function Chat({
 
   // New conversation clears the composer; every other remount keeps it.
   const discardRef = useRef(false);
-  const keyRef = useRef(tabId);
-  keyRef.current = tabId;
+  const keyRef = useRef(chatKey(path, part));
+  keyRef.current = chatKey(path, part);
   useEffect(() => {
     const box = inputRef.current;
-    const restored = draft ?? unstashDraft(keyRef.current);
-    if (box && restored.text) {
-      box.value = restoreDraftText(restored.text, box.value);
+    const draft = unstashDraft(keyRef.current);
+    if (box && draft.text) {
+      box.value = restoreDraftText(draft.text, box.value);
       grow();
     }
-    attachmentDraft.restore(restored.files);
+    attachmentDraft.restore(draft.files);
     return () => {
       if (discardRef.current) return;
       stashDraft(keyRef.current, { text: box?.value ?? "", files: attachmentDraft.current });
@@ -468,7 +453,7 @@ function Chat({
   useEffect(() => {
     // Dev-only test hook: the Rust side forwards loopback-socket text here so
     // UI automation can fill the composer without stealing keyboard focus.
-    if (!import.meta.env.DEV || hidden) return;
+    if (!import.meta.env.DEV) return;
     const unlisten = listen<string>("test-type", (event) => {
       if (inputRef.current) inputRef.current.value = event.payload;
       grow();
@@ -476,7 +461,7 @@ function Chat({
     return () => {
       unlisten.then((stop) => stop()).catch(() => {});
     };
-  }, [hidden]);
+  }, []);
 
   useEffect(() => {
     // Same hook, submit half: every mounted column hears the event, so only
@@ -528,10 +513,6 @@ function Chat({
 
   const applyEvent = useCallback(
     (event: ChatEvent) => {
-      setLastEventAt(Date.now());
-      if (restoringRef.current && initialItems?.length && !["session_error", "activity"].includes(event.type)) return;
-      if (event.type === "activity") { setPhase(event.phase); return; }
-      setPhase(event.type === "agent_thought" ? "Receiving provider thinking" : event.type === "agent_text" ? "Receiving response" : `Waiting for ${label}'s next update`);
       switch (event.type) {
         case "session_info":
           // Titles have no home since the visible session list went away.
@@ -546,12 +527,15 @@ function Chat({
           setPermissions((list) => list.filter((p) => p.id !== event.id));
           return;
         case "prose":
-          // Store prose in the CAD history while retaining this tab's own copy.
-          // Another conversation's prose never enters this tab's transcript.
+          // The finished block belongs to the project, not to this session, so
+          // it is written to the transcript and the streaming copy is dropped.
           if (isClaude) {
             // Drop the streaming copy only once the row exists, or the text
             // blinks out for the refetch's round trip.
             addMessage(projectId, "assistant", event.text, stampRef.current)
+              .then(() =>
+                setItems((list) => applyChatEvent(list, event, Date.now(), seqRef.current)),
+              )
               .catch((e) => setItems((list) => [...list, { kind: "note", text: String(e) }]));
             return;
           }
@@ -572,132 +556,52 @@ function Chat({
       }
       setItems((list) => applyChatEvent(list, event, Date.now(), seqRef.current));
     },
-    [isClaude, projectId, label],
+    [isClaude, projectId],
   );
 
-  const readConfig = useCallback(async (id: string) => {
-    const request = (configRequestsRef.current[id] ?? 0) + 1;
-    configRequestsRef.current[id] = request;
-    try {
-      const rows = await invoke<ConfigRow[]>("chat_config", {
-        agent: id,
-        sessionId: id === agent ? sessionRef.current : null,
-      });
-      if (closedRef.current || configRequestsRef.current[id] !== request || (id === agent && configuringRef.current)) return;
-      setProviderConfigs((current) => ({ ...current, [id]: rows }));
-      if (id === agent) {
-        const chosen = sessionRef.current ? rows : rows.map((row) => {
-          const value = choicesRef.current[row.category];
-          return value && row.options.some((option) => option.value === value) ? { ...row, value } : row;
-        });
-        choicesRef.current = Object.fromEntries(chosen.map((row) => [row.category, row.value]));
-        setConfig(chosen);
-      }
-    } catch (error) {
-      if (!closedRef.current && configRequestsRef.current[id] === request) {
-        setProviderErrors((current) => ({ ...current, [id]: String(error) }));
-      }
-    }
-  }, [agent]);
+  const refreshConfig = useCallback(() => {
+    invoke<ConfigRow[]>("chat_config", { agent, sessionId: sessionRef.current })
+      // An agent this project has never run has no cached lists yet; one
+      // throwaway session fills them, so the very first menu has models in it.
+      .then((rows) =>
+        rows.length > 0 ? rows : invoke<ConfigRow[]>("probe_chat_config", { agent, path }),
+      )
+      .then(setConfig)
+      .catch(() => {});
+  }, [agent, path]);
 
-  const refreshConfig = useCallback(() => { void readConfig(agent); }, [agent, readConfig]);
+  useEffect(refreshConfig, [refreshConfig]);
 
   useEffect(() => {
-    for (const id of new Set([...providerIds.split(",").filter(Boolean), agent])) void readConfig(id);
-  }, [providerIds, agent, readConfig]);
-
-  useEffect(() => {
-    const unlisten = listen("agent-config", () => {
-      for (const id of new Set([...providerIds.split(",").filter(Boolean), agent])) void readConfig(id);
-    });
-    return () => { unlisten.then((stop) => stop()); };
-  }, [providerIds, agent, readConfig]);
-
-  const discoverModels = async (id?: string) => {
-    const ids = id ? [id] : providerIds.split(",").filter(Boolean);
-    await Promise.all(ids.map(async (provider) => {
-      if (discoveryRef.current.has(provider)) return;
-      discoveryRef.current.add(provider);
-      setProviderLoading((current) => ({ ...current, [provider]: true }));
-      setProviderErrors((current) => ({ ...current, [provider]: null }));
-      try {
-        await invoke<ConfigRow[]>("refresh_chat_config", { path, agent: provider });
-        await readConfig(provider);
-      } catch (error) {
-        if (!closedRef.current) setProviderErrors((current) => ({ ...current, [provider]: String(error) }));
-      } finally {
-        discoveryRef.current.delete(provider);
-        if (!closedRef.current) setProviderLoading((current) => ({ ...current, [provider]: false }));
-      }
-    }));
-  };
+    // The lists arrive from the project's session-list probe, which can land
+    // after this column mounted. Without this the first chat opened on a fresh
+    // install has no picker until something else remounts it.
+    const unlisten = listen("agent-config", () => refreshConfig());
+    return () => {
+      unlisten.then((stop) => stop()).catch(() => {});
+    };
+  }, [refreshConfig]);
 
   const pick = useCallback(
     async (category: string, value: string) => {
-      if (configuringRef.current || sendingRef.current || startRef.current) return;
-      configuringRef.current = true;
-      configRequestsRef.current[agent] = (configRequestsRef.current[agent] ?? 0) + 1;
-      setConfiguring(true);
-      setConfigError(null);
       // Optimistic: the round trip goes through the adapter, and a select that
       // lags behind the click reads as a dropped one.
-      setConfig((rows) =>
-        rows.map((row) => (row.category === category ? { ...row, value } : row)),
-      );
+      setConfig((rows) => rows.map((row) => (row.category === category ? { ...row, value } : row)));
       try {
-        const rows = await invoke<ConfigRow[]>("set_chat_config", {
-          agent, sessionId: sessionRef.current, category, value,
-        });
-        choicesRef.current[category] = value;
-        setConfig(rows.map((row) => {
-          const own = choicesRef.current[row.category];
-          return !sessionRef.current && own && row.options.some((option) => option.value === own)
-            ? { ...row, value: own } : row;
-        }));
-      } catch (error) {
-        setConfigError(`Could not change this setting: ${String(error)}`);
+        setConfig(
+          await invoke<ConfigRow[]>("set_chat_config", {
+            agent,
+            sessionId: sessionRef.current,
+            category,
+            value,
+          }),
+        );
+      } catch {
         refreshConfig();
-        throw error;
-      } finally {
-        configuringRef.current = false;
-        setConfiguring(false);
       }
     },
     [agent, refreshConfig],
   );
-
-  const selectModel = async (target: string, value: string) => {
-    if (configuringRef.current) return;
-    if (target === agent) {
-      if (sendingRef.current || startRef.current || busy || starting) return;
-      await pick("model", value);
-      return;
-    }
-    configuringRef.current = true;
-    setConfiguring(true);
-    setConfigError(null);
-    let files: string[] = [];
-    try {
-      // Validate the choice before opening a tab. The new tab applies its own
-      // selection before prompting, while this conversation stays mounted.
-      await invoke<ConfigRow[]>("set_chat_config", {
-        agent: target, sessionId: null, category: "model", value,
-      });
-      files = await attachmentDraft.snapshot();
-      const transferred = await onAgent(target, items.length === 0 && !resumeRef.current && !sessionRef.current, {
-        text: inputRef.current?.value ?? "", files,
-      }, value);
-      if (!transferred) {
-        throw new Error("Your conversation and draft are still here. Try switching providers again.");
-      }
-    } catch (error) {
-      setConfigError(`Could not switch providers: ${String(error)}`);
-      throw error;
-    } finally {
-      configuringRef.current = false;
-      if (!closedRef.current) setConfiguring(false);
-    }
-  };
 
   const ensureSession = useCallback(async () => {
     if (sessionRef.current) return sessionRef.current;
@@ -708,12 +612,7 @@ function Chat({
       const requestedResume = resumeRef.current;
       restoringRef.current = Boolean(requestedResume);
       setStarting(true);
-      setTurnStartedAt(Date.now());
-      setLastEventAt(Date.now());
-      setPhase(requestedResume ? "Restoring conversation" : `Connecting to ${label}`);
       try {
-        const startupId = crypto.randomUUID();
-        startupIdRef.current = startupId;
         const onEvent = new Channel<ChatEvent>();
         onEvent.onmessage = applyEvent;
         const session = await invoke<string>("start_chat", {
@@ -722,8 +621,6 @@ function Chat({
           part,
           onEvent,
           resume: requestedResume,
-          startupId,
-          initialConfig: choicesRef.current,
         });
         if (closedRef.current) {
           // The user switched projects while the adapter was starting; without
@@ -731,24 +628,17 @@ function Chat({
           invoke("close_chat", { sessionId: session }).catch(() => {});
           throw new Error("chat closed");
         }
-        if (stoppedRef.current) {
-          await invoke("close_chat", { sessionId: session }).catch(() => {});
-          throw new Error("Stopped before sending. Your draft is preserved.");
-        }
         sessionRef.current = session;
         promptedPartRef.current = part;
         resumeRef.current = null;
-        restoringRef.current = false;
         onSessionRef.current(session);
         // The live session is authoritative: it may have clamped a remembered
         // pick the account no longer offers.
         refreshConfig();
         return session;
       } finally {
-        startupIdRef.current = null;
         startRef.current = null;
         setStarting(false);
-        setCancelling(false);
       }
     })();
     startRef.current = start;
@@ -781,10 +671,6 @@ function Chat({
     async (text: string, files: string[]) => {
       sendingRef.current = true;
       stoppedRef.current = false;
-      setCancelling(false);
-      setTurnStartedAt(Date.now());
-      setLastEventAt(Date.now());
-      setPhase(`Preparing ${label}`);
       // A refused file was about the draft this send replaces, and a failed restore
       // has been said. Live notes sit below Claude's stored turns, so left alone
       // either would trail every later reply.
@@ -796,9 +682,9 @@ function Chat({
         ),
       );
       const localId = nextLocalIdRef.current++;
-      // Each conversation owns its spoken turns, including native Claude.
-      // The project also keeps a shared audit trail for the CAD tools.
-      {
+      // Claude's turn is stored, not replayed, so the line comes back from the
+      // project instead of living here for the session.
+      if (!isClaude) {
         setItems((list) => [
           ...list,
           {
@@ -865,10 +751,8 @@ function Chat({
       } catch (e) {
         const message = String(e);
         const trouble = isClaude ? claudeNote(message) : null;
-        // Before send_prompt starts, every failure is an unsent draft. Once a
-        // prompt is in flight, restoring it could accidentally send it twice.
-        if (!stored && !promptingRef.current) restoreDraft();
         if (trouble || refused || message.includes("auth_required")) {
+          if (!stored) restoreDraft();
           if (trouble) setItems((list) => withNote(list, trouble));
           else if (refused) {
             refusalRef.current = message;
@@ -883,7 +767,6 @@ function Chat({
         setBusy(false);
         onBusyRef.current(false);
         setPermissions([]);
-        setCancelling(false);
         // Every completed turn gets a cue, where the old chime waited 8s: the cue
         // is short enough that a short reply can have one, and it marks the beat.
         // Two of them: "ready" is for someone watching the part, "arrival"
@@ -975,7 +858,6 @@ function Chat({
   const typed = (event: FormEvent<HTMLTextAreaElement>) => {
     grow();
     nudgeGridfinity(event.currentTarget.value);
-    callbacks.current.onDraft?.({ text: event.currentTarget.value, files: attachments });
   };
 
   const dragEnter = (event: DragEvent<HTMLFormElement>) => {
@@ -1004,21 +886,157 @@ function Chat({
     }
   };
 
-  const cancel = async () => {
-    stoppedRef.current = true;
-    setCancelling(true);
-    if (startupIdRef.current) await invoke("cancel_chat_start", { startupId: startupIdRef.current }).catch(() => {});
-    const session = sessionRef.current;
-    if (session && promptingRef.current) await invoke("cancel_turn", { sessionId: session }).catch((e) => setItems((list) => withNote(list, String(e))));
-  };
-  const disconnect = async () => {
+  const cancel = () => {
     stoppedRef.current = true;
     const session = sessionRef.current;
-    if (startupIdRef.current) await invoke("cancel_chat_start", { startupId: startupIdRef.current }).catch(() => {});
-    if (session) await invoke("close_chat", { sessionId: session });
-    sessionRef.current = null;
-    setBusy(false); setStarting(false); setCancelling(false); onBusyRef.current(false);
+    if (session && promptingRef.current) {
+      invoke("cancel_turn", { sessionId: session }).catch(() => {});
+    }
   };
+
+  // One menu: which agent, then that agent's own settings (its model, and how
+  // hard it thinks). Picking an agent only turns the menu to it, because the
+  // real switch remounts this column and would take the open menu with it;
+  // the switch lands when the menu closes.
+  const [focus, setFocus] = useState<string | null>(null);
+  const [focusRows, setFocusRows] = useState<ConfigRow[]>([]);
+  const [focusState, setFocusState] = useState<"ready" | "loading" | "error">("ready");
+  const [focusError, setFocusError] = useState("");
+  useEffect(() => {
+    if (!focus) return;
+    let stale = false;
+    setFocusRows([]);
+    setFocusState("loading");
+    // The cache answers at once for an agent this project has run; a first
+    // look at Codex costs one throwaway session, which is why it is asked
+    // for only when the menu turns to it.
+    invoke<ConfigRow[]>("chat_config", { agent: focus, sessionId: null })
+      .then((rows) =>
+        rows.length > 0 ? rows : invoke<ConfigRow[]>("probe_chat_config", { agent: focus, path }),
+      )
+      .then((rows) => {
+        if (stale) return;
+        setFocusRows(rows);
+        setFocusState("ready");
+      })
+      .catch((error) => {
+        if (stale) return;
+        setFocusError(String(error));
+        setFocusState("error");
+      });
+    return () => {
+      stale = true;
+    };
+  }, [focus, path]);
+
+  const looking = focus ?? agent;
+  const lookingLabel = AGENT_LABEL[looking] ?? looking;
+  const shownRows = focus ? focusRows : config;
+  const pickFor = useCallback(
+    async (category: string, value: string) => {
+      if (!focus) return pick(category, value);
+      setFocusRows((rows) =>
+        rows.map((row) => (row.category === category ? { ...row, value } : row)),
+      );
+      try {
+        setFocusRows(
+          await invoke<ConfigRow[]>("set_chat_config", {
+            agent: focus,
+            sessionId: null,
+            category,
+            value,
+          }),
+        );
+      } catch {
+        // The optimistic value stands; the next open reloads the rows.
+      }
+    },
+    [focus, pick],
+  );
+  const pickerItems: MenuItem[] = [
+    // Starting over belongs beside the agent, because switching agents starts a
+    // fresh conversation too.
+    ...(said
+      ? [
+          {
+            section: "Conversation",
+            label: "New conversation",
+            disabled: busy || starting,
+            onSelect: () => {
+              discardRef.current = true;
+              onFresh();
+            },
+          },
+        ]
+      : []),
+    ...(agents.length > 1
+      ? agents.map((option) => ({
+          section: "Agent",
+          label: option.label,
+          checked: option.id === looking,
+          keepOpen: true,
+          trailing:
+            option.loggedIn === false ? (
+              <span className="rounded-[2px] border border-line px-1 py-px font-mono text-[9px] leading-3 font-medium tracking-[0.1em] text-faint uppercase">
+                sign in
+              </span>
+            ) : undefined,
+          onSelect: () => setFocus(option.id === agent ? null : option.id),
+        }))
+      : []),
+    ...shownRows.flatMap((row) =>
+      row.options.map((option) => {
+        // A word fits beside the name; Codex's sentences go on hover.
+        const short = option.description && option.description.length <= 16;
+        return {
+          section: SECTION_LABEL[row.category] ?? row.name,
+          label: option.name,
+          checked: option.value === row.value,
+          keepOpen: true,
+          trailing: short ? (
+            <span className="mono-caption text-faint">{option.description}</span>
+          ) : undefined,
+          title: short ? undefined : option.description,
+          onSelect: () => pickFor(row.category, option.value),
+        };
+      }),
+    ),
+    ...(focus && focusState === "loading"
+      ? [
+          {
+            section: "Model",
+            label: `Asking ${lookingLabel} for its models…`,
+            disabled: true,
+            keepOpen: true,
+            onSelect: () => {},
+          },
+        ]
+      : []),
+    ...(focus && focusState === "error"
+      ? [
+          {
+            section: "Model",
+            label: focusError,
+            disabled: true,
+            keepOpen: true,
+            onSelect: () => {},
+          },
+        ]
+      : []),
+  ];
+  // The menu closing is the commit: the agent it was turned to takes over.
+  const menuClosed = () => {
+    if (focus && focus !== agent) onAgent(focus, !said);
+    setFocus(null);
+  };
+  const footer =
+    focus && focus !== agent
+      ? said
+        ? `${lookingLabel} starts a fresh conversation`
+        : `Switches to ${lookingLabel} when this closes`
+      : shownRows.length > 0
+        ? "Bigger models use up your plan"
+        : undefined;
 
   const signIn = async () => {
     const needsResend = authNeeded === "resend";
@@ -1072,20 +1090,39 @@ function Chat({
   let counted = 0;
   const nextTurn = () => String(++counted).padStart(2, "0");
 
-  // Shared CAD cards precede this conversation's own prose and expandable tool calls.
+  // The conversation in order: what was said, and the cards that carry meaning. The
+  // tool calls in between are how it got there, and stay off the page.
   const flow: ({ kind: "stored"; message: Message } | { kind: "live"; item: Item; index: number })[] = [];
   for (const message of ordered) if (message.content || !isWork(message)) flow.push({ kind: "stored", message });
-  items.forEach((item, index) => flow.push({ kind: "live", item, index }));
-
-  const work = activityStatus({ label, starting, restoring: restoringRef.current, cancelling, permission: permissions.length > 0, phase, lastEventAt, now: clock, tools: items.flatMap((item) => item.kind === "step" ? [{ kind: "tool" as const, id: item.step.id, title: item.tool ?? `${item.step.verb} ${item.step.object}`, status: item.step.status === "running" ? "in_progress" : item.step.status === "done" ? "completed" : item.step.status }] : []) });
+  items.forEach((item, index) => item.kind !== "step" && flow.push({ kind: "live", item, index }));
 
   return (
-    <div className="fork-chat" hidden={hidden}>
-    {tabBar}
     <ChatPanel
       hidden={hidden}
       dragRegion
       strip={{ label: "Conversation" }}
+      picker={
+        <Menu
+          label={config.length > 0 ? `${label} is set to ${summarize(config)}` : "switch agents"}
+          disabled={busy || starting}
+          triggerClassName="mono-caption h-[22px] max-w-[212px] gap-1.5 border border-line pr-1.5 pl-2 font-medium text-ink [letter-spacing:0.1em] hover:border-panel-edge disabled:opacity-40"
+          trigger={() => (
+            <>
+              <span className="shrink-0">{label}</span>
+              {config.length > 0 && (
+                <span className="truncate font-normal text-muted">· {summarize(config)}</span>
+              )}
+              <Icon name="chevron-down" className="shrink-0 text-muted" />
+            </>
+          )}
+          menuClassName="w-[240px] normal-case"
+          items={pickerItems}
+          footer={footer}
+          onOpenChange={(open) => {
+            if (!open) menuClosed();
+          }}
+        />
+      }
       composer={
         <form
           onSubmit={submit}
@@ -1157,14 +1194,10 @@ function Chat({
                 disabled={starting}
                 onClick={attach}
               />
-              <ModelPicker agent={agent} providers={agents.map((provider) => ({ ...provider, config: provider.id === agent ? config : providerConfigs[provider.id] ?? [], loading: providerLoading[provider.id], error: providerErrors[provider.id] }))}
-                config={config} disabled={false} activeProviderBusy={busy || starting} configuring={configuring} error={configError} hasConversation={said}
-                onSelectModel={selectModel} onSelectConfig={pick} onRefresh={discoverModels} onSignIn={onSignIn}
-                onOpen={() => { if (!discoveryStartedRef.current) { discoveryStartedRef.current = true; void discoverModels(); } }} />
               <McpPanel path={path} sessionId={sessionRef.current} hidden={hidden} />
             </div>
-            {busy || starting ? (
-              <Button type="button" variant="accent" onClick={(event) => { event.preventDefault(); void cancel(); }}>
+            {busy ? (
+              <Button type="button" variant="accent" onClick={(event) => { event.preventDefault(); cancel(); }}>
                 stop
               </Button>
             ) : (
@@ -1255,12 +1288,6 @@ function Chat({
                   ))}
                 </ul>
               );
-            case "step":
-              return <details key={item.step.id} className="fork-tool">
-                <summary><span>{item.tool ?? `${item.step.verb} ${item.step.object}`}</span><span>{item.step.status} · {elapsedLabel((item.step.elapsed_s ?? Math.max(0, (clock - Date.parse(item.step.started_at)) / 1000)) * 1000)}</span></summary>
-                {item.step.input !== undefined && <pre>{typeof item.step.input === "string" ? item.step.input : JSON.stringify(item.step.input, null, 2)}</pre>}
-                {item.step.output && <pre>{typeof item.step.output === "string" ? item.step.output : JSON.stringify(item.step.output, null, 2)}</pre>}
-              </details>;
             case "note":
               return (
                 <p key={index} className="text-chat text-muted">
@@ -1269,11 +1296,23 @@ function Chat({
               );
           }
         })}
-        {(busy || starting) && <div className="fork-activity" role="status" aria-live="polite">
-          <div><strong>{work.title}</strong><span>{elapsedLabel(clock - turnStartedAt)}</span></div>
-          <p>{work.detail}</p>
-          {cancelling && work.quiet && <button type="button" onClick={() => void disconnect().catch((e) => setItems((list) => withNote(list, String(e))))}>Disconnect agent</button>}
-        </div>}
+        {starting && (
+          <p className="mono-caption text-muted">
+            {restoringRef.current ? "restoring conversation…" : `starting ${label}…`}
+          </p>
+        )}
+        {/* A first build can run ten minutes or more; a silent transcript
+            reads as a hang, so the turn keeps a heartbeat on screen. Hidden
+            while a dialog is up, since then it is the user's move. */}
+        {busy && !starting && permissions.length === 0 && (
+          <p className="mono-caption flex items-center gap-2 text-muted">
+            <span
+              className="size-1.5 shrink-0 animate-pulse rounded-full bg-accent"
+              aria-hidden="true"
+            />
+            {label} is {activity(items)}…
+          </p>
+        )}
         {authNeeded !== "none" && (
           <div className="flex flex-col items-start gap-2 rounded-[6px] bg-raised p-3">
             <p className="text-chat text-muted">{label} isn't signed in on this Mac.</p>
@@ -1304,7 +1343,6 @@ function Chat({
         </div>
       </div>
     </ChatPanel>
-    </div>
   );
 }
 

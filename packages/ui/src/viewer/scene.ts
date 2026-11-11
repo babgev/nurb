@@ -385,36 +385,3 @@ export function disposeGroup(group: Object3D): void {
     disposeMaterial(drawable.material)
   })
 }
-
-
-export interface AssemblyJoint {
-  node: string
-  param: string | null
-  name: string
-  origin: [number, number, number]
-  dir: [number, number, number]
-  lo: number
-  hi: number
-  at: number
-}
-
-/** Pose against the loaded geometry, never against the previous slider tick. */
-export function poseAssembly(group: Group, joints: AssemblyJoint[], values: Record<string, number | boolean | string>) {
-  for (const joint of joints) {
-    const node = group.getObjectByName(joint.node)
-    const value = joint.param ? values[joint.param] : undefined
-    const angle = typeof value === "number" && Number.isFinite(value) ? value : joint.at
-    if (!node || !Number.isFinite(angle) || !Number.isFinite(joint.at)) continue
-    const direction = new Vector3(...joint.dir)
-    if (!direction.lengthSq()) continue
-    const base: Matrix4 = node.userData.nurbJointBase ??= node.matrix.clone()
-    const [x, y, z] = joint.origin
-    node.matrixAutoUpdate = false
-    node.matrix.copy(new Matrix4().makeTranslation(x, y, z)
-      .multiply(new Matrix4().makeRotationAxis(direction.normalize(), (angle - joint.at) * Math.PI / 180))
-      .multiply(new Matrix4().makeTranslation(-x, -y, -z))
-      .multiply(base))
-    node.matrixWorldNeedsUpdate = true
-  }
-  group.updateMatrixWorld(true)
-}

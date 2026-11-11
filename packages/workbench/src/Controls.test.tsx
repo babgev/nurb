@@ -66,21 +66,6 @@ afterEach(() => {
 })
 
 describe("sliders", () => {
-  it("keeps a migrated assembly's lid slider within its declared hinge range", async () => {
-    state = withPart({
-      params: [{ name: "lid_open", kind: "float", default: 70 }],
-      build: { ...base.build!, stats: { joints: [{ node: "joint0", param: "lid_open", name: "lid", origin: [0, 0, 0], dir: [1, 0, 0], lo: 15, hi: 92, at: 70 }] } },
-    })
-    install({ "POST /api/parts/part-lid/params": () => ({ build: state.parts[0].build }) })
-    render(<App />)
-    const slider = await screen.findByLabelText("lid open")
-    expect(slider).toHaveAttribute("min", "15")
-    expect(slider).toHaveAttribute("max", "92")
-    fireEvent.change(slider, { target: { value: "20" } })
-    await waitFor(() => expect(sent("/params")).toHaveLength(1))
-    expect(sent("/params")[0].body).toEqual({ values: { lid_open: 20 } })
-  })
-
   it("posts the whole value map once, after the debounce", async () => {
     state = withPart({
       params: [

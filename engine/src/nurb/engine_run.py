@@ -98,10 +98,6 @@ def _build_in_process(
             "ms": round(ms, 1),
             "glb_hash": hashlib.blake2b(glb, digest_size=16).hexdigest(),
         }
-        scene = getattr(shape, "_nurb_scene", None)
-        if scene is not None:
-            from .assembly import wire
-            stats["joints"] = wire(scene)
         payloads = getattr(shape, "_nurb_payloads", None)
         if payloads:
             stats["payloads"] = [name for _, name in payloads]
