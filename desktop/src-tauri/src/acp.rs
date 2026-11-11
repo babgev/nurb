@@ -2,13 +2,14 @@
 //! (Claude Code or Codex, see agents.rs), spoken to over stdio JSON-RPC,
 //! streaming updates to the webview through a Tauri ipc channel.
 
-mod events;
+pub(crate) mod events;
+pub(crate) mod mcp;
 mod policy;
 pub(crate) mod sandbox;
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,7 +20,8 @@ use agent_client_protocol::schema::v1::{
     ListSessionsRequest, LoadSessionRequest, Meta, NewSessionRequest, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigSelectOptions,
-    SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, TextContent,
+    SessionId, SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, TextContent,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
@@ -88,7 +90,266 @@ use events::{forward, permission_choice, permission_title, wire_string};
 
 /// The whole-project conversation rides the per-part session plumbing under a
 /// name no part file can have. The twin constant lives in desktop/src/Chat.tsx.
-const PROJECT_CHAT: &str = "//project";
+pub(crate) const PROJECT_CHAT: &str = "//project";
+/// A part the person is starting inside a folder, before it has a name.
+pub(crate) const NEW_PART: &str = "//new";
+pub(crate) const NEW_PART_CONTEXT: &str = " The user is starting a new part in this project and is about to describe it. Make it as a new part alongside the others, and reuse the project's shared settings where they fit.";
+
+/// The project id an agent working directory belongs to; the app hands agents
+/// <appdata>/projects/<id> as their cwd, so the last segment is the id.
+pub(crate) fn project_key(project: &Path) -> String {
+    project
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| project.display().to_string())
+}
+
+/// The serve every session's tools point at. `start` waits for a cold serve;
+/// the rail's listing does not.
+async fn serve_entry(app: &tauri::AppHandle, start: bool) -> Option<crate::supervisor::ServeInfo> {
+    use tauri::Manager;
+    if !start {
+        return app
+            .state::<crate::supervisor::Supervisor>()
+            .published_live();
+    }
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        handle.state::<crate::supervisor::Supervisor>().ensure()
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+}
+
+/// The nurb MCP server for one session, or nothing when the serve is not up
+/// or the agent cannot reach it.
+fn mcp_entry(
+    caps: &agent_client_protocol::schema::v1::McpCapabilities,
+    serve: Option<&crate::supervisor::ServeInfo>,
+) -> Option<agent_client_protocol::schema::v1::McpServer> {
+    mcp::nurb_mcp_server(caps, serve?)
+}
+
+/// The folder fallback's bookkeeping: where the agent is working, where the
+/// parts go back to, and what they looked like when it started.
+#[derive(Clone)]
+struct Capture {
+    root: PathBuf,
+    serve: crate::supervisor::ServeInfo,
+    project_id: String,
+    label: &'static str,
+    parts: Arc<Mutex<HashMap<String, String>>>,
+}
+
+/// Hand back every named part whose source has moved since the snapshot.
+async fn capture_parts(capture: Capture, names: Vec<String>, channel: Channel<ChatEvent>) {
+    for name in names {
+        let path = capture.root.join("parts").join(format!("{name}.py"));
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if capture.parts.lock().unwrap().get(&name) == Some(&source) {
+            continue;
+        }
+        match mcp::capture(
+            &capture.serve,
+            &capture.project_id,
+            &name,
+            &source,
+            capture.label,
+        )
+        .await
+        {
+            Ok(_) => {
+                capture.parts.lock().unwrap().insert(name, source);
+            }
+            Err(sentence) => {
+                let note = ChatEvent::Note { text: sentence };
+                events::mirror(&note);
+                let _ = channel.send(note);
+            }
+        }
+    }
+}
+
+/// Where this chat's agent works: the project itself when the tools reach it,
+/// a checked-out copy when they do not. The copy is the only way an agent
+/// that cannot call the tools can still change a part.
+async fn working_folder(
+    launcher: &crate::env::Launcher,
+    kind: AgentKind,
+    project: &Path,
+    data: &Path,
+    serve: Option<&crate::supervisor::ServeInfo>,
+    channel: &Channel<ChatEvent>,
+) -> Result<Option<Capture>, String> {
+    // The native driver passes the tools on its own command line, and without
+    // a serve there is nothing to check or to hand parts back to.
+    let (Some(serve), false) = (serve, kind == AgentKind::Claude) else {
+        return Ok(None);
+    };
+    let key = mcp::verdict_key(kind.id(), kind.adapter());
+    let verdict = match mcp::read_verdict(data, &key) {
+        Some(verdict) => Some(verdict),
+        None => {
+            note(
+                channel,
+                format!("Checking that {} can reach the nurb tools…", kind.label()),
+            );
+            let asked = probe_tools(launcher, kind, data, serve).await;
+            if let Some(verdict) = &asked {
+                mcp::write_verdict(data, &key, verdict);
+            }
+            asked
+        }
+    };
+    if verdict.map(|verdict| verdict.tools).unwrap_or(false) {
+        return Ok(None);
+    }
+    let project_id = project_key(project);
+    let root = project.join("checkout");
+    let _ = std::fs::remove_dir_all(&root);
+    mcp::checkout(serve, &project_id, &root).await?;
+    note(
+        channel,
+        format!(
+            "The nurb tools did not reach {}, so this chat works in a copy of the project folder and every part it writes is captured back.",
+            kind.label()
+        ),
+    );
+    Ok(Some(Capture {
+        parts: Arc::new(Mutex::new(mcp::snapshot_parts(&root))),
+        root,
+        serve: serve.clone(),
+        project_id,
+        label: kind.label(),
+    }))
+}
+
+fn note(channel: &Channel<ChatEvent>, text: String) {
+    let note = ChatEvent::Note { text };
+    events::mirror(&note);
+    let _ = channel.send(note);
+}
+
+/// Canceling chat startup drops the tool probe before its normal reap path.
+/// Its process group must not keep running after that cancellation.
+struct ProbeProcess(Option<i32>);
+impl Drop for ProbeProcess {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.0.filter(|pgid| *pgid > 0) {
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// One throwaway session whose only question is whether the MCP entry landed.
+/// ACP cannot list a model's tools, so the model is asked.
+async fn probe_tools(
+    launcher: &crate::env::Launcher,
+    kind: AgentKind,
+    data: &Path,
+    serve: &crate::supervisor::ServeInfo,
+) -> Option<mcp::Verdict> {
+    // Its own cwd, so this session never lands in the project's history:
+    // codex's session list is filtered by working directory.
+    let cwd = data.join("probe").join(kind.id());
+    std::fs::create_dir_all(&cwd).ok()?;
+    let (program, args) = launcher.adapter(kind);
+    let (program, args) = sandbox::wrap(program, args, &cwd, &launcher.engine_root());
+    let mut config = AcpAgentConfig::new(program).args(args);
+    if let Some(path) = launcher.adapter_path() {
+        config = config.env("PATH", path);
+    }
+    if kind == AgentKind::Gemini {
+        if let Ok(key) = crate::agents::gemini_api_key() {
+            config = config.env("GEMINI_API_KEY", key);
+        }
+    }
+    let (stdin, stdout, stderr, child) = AcpAgent::new(config).spawn_process().ok()?;
+    let pgid = child.id() as i32;
+    let mut probe_process = ProbeProcess(Some(pgid));
+    drain_stderr(kind, stderr);
+    let said = Arc::new(Mutex::new(String::new()));
+    let heard = Arc::clone(&said);
+    // A model that calls the tool and narrates nothing has still proved the
+    // server connected, so the call itself counts.
+    let called = Arc::new(AtomicBool::new(false));
+    let saw_call = Arc::clone(&called);
+    let transport = Arc::new(Mutex::new(String::new()));
+    let chosen = Arc::clone(&transport);
+    let serve = serve.clone();
+    let asked = tokio::time::timeout(
+        Duration::from_secs(60),
+        Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    match notification.update {
+                        SessionUpdate::AgentMessageChunk(chunk) => {
+                            if let ContentBlock::Text(text) = chunk.content {
+                                heard.lock().unwrap().push_str(&text.text);
+                            }
+                        }
+                        SessionUpdate::ToolCall(call) => {
+                            if mcp::nurb_tool(&call.title).is_some() {
+                                saw_call.store(true, Ordering::Relaxed);
+                            }
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(
+                ByteStreams::new(stdin, stdout),
+                move |cx: ConnectionTo<Agent>| async move {
+                    let init = cx
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let caps = &init.agent_capabilities.mcp_capabilities;
+                    *chosen.lock().unwrap() = if caps.http { "http" } else { "none" }.to_string();
+                    let entry = mcp::nurb_mcp_server(caps, &serve);
+                    let mut opening = NewSessionRequest::new(cwd);
+                    if let Some(entry) = entry {
+                        opening = opening.mcp_servers(vec![entry]);
+                    }
+                    let session = cx.send_request(opening).block_task().await?;
+                    cx.send_request(PromptRequest::new(
+                        session.session_id,
+                        vec![ContentBlock::Text(TextContent::new(mcp::PROBE_PROMPT))],
+                    ))
+                    .block_task()
+                    .await?;
+                    Ok(())
+                },
+            ),
+    )
+    .await;
+    reap(pgid, child).await;
+    probe_process.0 = None;
+    // A probe that timed out or errored answers for nothing, so it is not
+    // remembered; the next chat asks again.
+    asked.ok()?.ok()?;
+    let reply = said.lock().unwrap().clone();
+    let transport = transport.lock().unwrap().clone();
+    let tools = mcp::tools_reached(&reply, called.load(Ordering::Relaxed));
+    eprintln!(
+        "[probe] {} over {transport}: tools={tools} called={} reply={reply:?}",
+        kind.id(),
+        called.load(Ordering::Relaxed)
+    );
+    Some(mcp::Verdict {
+        tools,
+        transport,
+        checked_at: mcp::now(),
+    })
+}
 
 type Pending = Arc<Mutex<HashMap<u32, oneshot::Sender<RequestPermissionOutcome>>>>;
 
@@ -112,6 +373,9 @@ struct ChatSession {
     /// model rebuilds the effort list, and `session/set_model` does not return
     /// the new menus.
     grok_models: Vec<GrokModelMenu>,
+    /// Set only when the tools never reached this agent: the copy of the
+    /// project it works in, and what it takes to hand parts back.
+    checkout: Option<Capture>,
     pgid: i32,
     /// Dropped (with the whole entry) to end the connection task, which kills
     /// the adapter's process group.
@@ -143,9 +407,11 @@ pub async fn start_chat(
     app: tauri::AppHandle,
     path: String,
     agent: String,
+    part: Option<String>,
     on_event: Channel<ChatEvent>,
     resume: Option<String>,
     startup_id: Option<String>,
+    initial_config: Option<HashMap<String, String>>,
 ) -> Result<String, String> {
     let kind = AgentKind::parse(&agent)?;
     let project = PathBuf::from(&path);
@@ -158,7 +424,23 @@ pub async fn start_chat(
     let (startup_tx, startup_rx) = oneshot::channel();
     if let Some(id) = &startup_id {
         use tauri::Manager;
-        app.state::<Chats>().starting.lock().unwrap().insert(id.clone(), startup_tx);
+        app.state::<Chats>()
+            .starting
+            .lock()
+            .unwrap()
+            .insert(id.clone(), startup_tx);
+    }
+    if kind == AgentKind::Claude {
+        let result = tokio::select! {
+            biased;
+            _ = startup_cancelled(startup_rx) => Err("Conversation startup cancelled.".into()),
+            result = crate::claude::start(app.clone(), project, part, on_event, resume, initial_config) => result,
+        };
+        if let Some(id) = startup_id {
+            use tauri::Manager;
+            app.state::<Chats>().starting.lock().unwrap().remove(&id);
+        }
+        return result;
     }
     tauri::async_runtime::spawn(run_chat(
         app.clone(),
@@ -171,6 +453,7 @@ pub async fn start_chat(
         close_tx,
         close_rx,
         startup_rx,
+        initial_config,
     ));
     let ready = ready_rx.await;
     if let Some(id) = startup_id {
@@ -205,19 +488,26 @@ pub async fn list_sessions(
     use tauri::Manager;
     let project = PathBuf::from(&path);
     let launcher = app.state::<crate::env::Launcher>().inner().clone();
+    // The tools every session gets. A rail refresh must never be what starts
+    // the serve, so a serve that is not up yet just means no entry here.
+    let serve = serve_entry(&app, false).await;
     // Every agent in parallel, skipping the native CLIs that are not on this
     // machine: spawning those just to watch them fail is noise, where the
     // adapters (always present once provisioned) fail informatively.
     let checks: Vec<_> = crate::agents::ALL
         .into_iter()
+        // The driver answers no session/list, so its history rides the
+        // adapter's entry until it speaks for itself.
+        .filter(|kind| *kind != AgentKind::Claude)
         .filter(|kind| kind.native_command().is_none() || launcher.adapter_available(*kind))
         .map(|kind| {
             let launcher = launcher.clone();
             let project = project.clone();
+            let serve = serve.clone();
             (
                 kind,
                 tauri::async_runtime::spawn(async move {
-                    agent_sessions(&launcher, kind, project, false).await
+                    agent_sessions(&launcher, kind, project, serve, false).await
                 }),
             )
         })
@@ -260,7 +550,7 @@ pub async fn list_sessions(
         .into_iter()
         .map(|(kind, session)| {
             let id = wire_string(&session.session_id);
-            let part = store.part_of(&id, &project);
+            let part = store.part_of(&id, &project_key(&project));
             SessionEntry {
                 id,
                 title: session.title,
@@ -280,6 +570,7 @@ async fn agent_sessions(
     launcher: &crate::env::Launcher,
     kind: AgentKind,
     project: PathBuf,
+    serve: Option<crate::supervisor::ServeInfo>,
     models_only: bool,
 ) -> Result<
     (
@@ -305,6 +596,7 @@ async fn agent_sessions(
         .spawn_process()
         .map_err(|error| friendly(kind, error))?;
     let pgid = child.id() as i32;
+    let mut probe_process = ProbeProcess(Some(pgid));
     drain_stderr(kind, stderr);
     let listed = tokio::time::timeout(
         Duration::from_secs(60),
@@ -321,6 +613,8 @@ async fn agent_sessions(
                         .send_request(InitializeRequest::new(ProtocolVersion::V1))
                         .block_task()
                         .await?;
+                    let entry =
+                        mcp_entry(&init.agent_capabilities.mcp_capabilities, serve.as_ref());
                     let menus = grok_model_menus(init.meta.as_ref()).unwrap_or_default();
                     let model_rows = grok_rows_by_model(&menus);
                     // Only a session knows what models the agent offers, and a
@@ -330,17 +624,21 @@ async fn agent_sessions(
                     // asking here is what lets the very first chat of a fresh
                     // install open with a working picker. Failure (a signed-out
                     // Codex answers -32000) just means no picker.
-                    let discovered = cx
-                        .send_request(NewSessionRequest::new(project.clone()))
-                        .block_task()
-                        .await
-                        .map(|session| {
-                            picker_rows(
-                                &session.config_options.unwrap_or_default(),
-                                session.meta.as_ref(),
-                                init.meta.as_ref(),
-                            )
-                        });
+                    // This throwaway session is only asked what models the
+                    // agent offers, but it is a real session, and a session
+                    // without the tools would answer for a configuration the
+                    // user never runs in.
+                    let mut opening = NewSessionRequest::new(project.clone());
+                    if let Some(entry) = entry.clone() {
+                        opening = opening.mcp_servers(vec![entry]);
+                    }
+                    let discovered = cx.send_request(opening).block_task().await.map(|session| {
+                        picker_rows(
+                            &session.config_options.unwrap_or_default(),
+                            session.meta.as_ref(),
+                            init.meta.as_ref(),
+                        )
+                    });
                     let config = match discovered {
                         Ok(config) => config,
                         Err(error) if models_only && menus.is_empty() => return Err(error),
@@ -367,6 +665,7 @@ async fn agent_sessions(
     )
     .await;
     reap(pgid, child).await;
+    probe_process.0 = None;
     listed
         .map_err(|_| {
             if models_only {
@@ -379,6 +678,8 @@ async fn agent_sessions(
         .map_err(|error| friendly(kind, error))
 }
 
+const COPY_LIMIT: u64 = 500 * 1024 * 1024;
+
 #[tauri::command]
 pub async fn send_prompt(
     app: tauri::AppHandle,
@@ -388,7 +689,21 @@ pub async fn send_prompt(
     attachments: Vec<String>,
 ) -> Result<String, String> {
     use tauri::Manager;
-    let (conn, session, project, kind) = {
+    if let Some(driver) = app.state::<crate::claude::Drivers>().get(&session_id) {
+        app.state::<crate::sessions::SessionStore>().record(
+            &session_id,
+            AgentKind::Claude.id(),
+            &project_key(&driver.project),
+            part,
+        );
+        // The part and the audience live in the CLI's system prompt, set when
+        // the session started, so the turn carries the user's words and files.
+        let meshes = describe_meshes(&app, &attachments).await?;
+        let content = crate::claude::user_content(text, &attachments, &meshes)?;
+        remember_photos(&app, &project_key(&driver.project), &attachments).await;
+        return driver.prompt(content).await;
+    }
+    let (conn, session, project, kind, capture, capture_channel) = {
         let sessions = app.state::<Chats>();
         let sessions = sessions.sessions.lock().unwrap();
         let chat = sessions.get(&session_id).ok_or("chat is not running")?;
@@ -397,6 +712,8 @@ pub async fn send_prompt(
             chat.session.clone(),
             chat.project.clone(),
             chat.agent,
+            chat.checkout.clone(),
+            chat.channel.clone(),
         )
     };
     // Remember which part was on screen for this session, so reopening it
@@ -404,38 +721,28 @@ pub async fn send_prompt(
     app.state::<crate::sessions::SessionStore>().record(
         &session_id,
         kind.id(),
-        &project,
+        &project_key(&project),
         part.clone(),
     );
     // Each chat column belongs to one part, and that identity travels with
     // every turn, so "make the lip taller" lands on the right part. The
-    // server's real address matters too: without it the agent probes with
-    // lsof and can find another project's server (seen live: it told the
-    // user the wrong port). The audience line shapes the replies: the app's
-    // users are hobbyists, and phrasing like "parts/lid.py:5" in an answer
-    // is the file system leaking into a product that promises not to have
-    // one.
-    let project_name = project
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| project.display().to_string());
-    let server = app
-        .state::<crate::supervisor::Supervisor>()
-        .port(&project)
-        .map(|port| {
-            format!(
-                " This project's nurb dev server is already running at http://127.0.0.1:{port} and its viewer is on screen beside this chat; never start another one."
-            )
-        })
-        .unwrap_or_default();
+    // audience line shapes the replies: the app's users are hobbyists, and an
+    // answer that names a source file is the file system leaking into a
+    // product that promises not to have one.
+    let project_name = project_key(&project);
     let selected = match part.as_deref() {
-        // The rail's project row; the twin constant lives in Chat.tsx.
-        Some(PROJECT_CHAT) => " This conversation is about the whole project rather than one part. You can create parts with `nurb new`, edit any part, and lift design the parts share into system.py at the project root; the app notices new and rebuilt parts on its own.".to_string(),
-        Some(part) => format!(" This conversation is about the part \"{part}\", which is on screen beside the chat."),
+        // A folder's own conversation; the twin constant lives in Chat.tsx.
+        Some(PROJECT_CHAT) => {
+            " This conversation is about the project as a whole rather than one part.".to_string()
+        }
+        Some(NEW_PART) => NEW_PART_CONTEXT.to_string(),
+        Some(part) => format!(
+            " This conversation is about the part \"{part}\", which is on screen beside the chat."
+        ),
         None => String::new(),
     };
     let context = format!(
-        "Context: nurb project \"{project_name}\".{selected}{server} \
+        "Context: nurb project \"{project_name}\".{selected} \
         The user is a 3D-printing hobbyist, not a programmer, and the app hides all files and code: \
         in your replies, talk about the part, its features, and its dimensions in plain language, and \
         never mention file names, paths, line numbers, code, or Python. The viewer is built into this \
@@ -449,14 +756,35 @@ pub async fn send_prompt(
     if !text.trim().is_empty() {
         blocks.push(ContentBlock::Text(TextContent::new(text)));
     }
+    let meshes = describe_meshes(&app, &attachments).await?;
     for path in &attachments {
         blocks.push(attachment_block(std::path::Path::new(path))?);
+        // The agent gets the file, and also the view Claude gets, since none of
+        // them reads a 3MF on its own.
+        if let Some((text, png)) = meshes.get(path) {
+            use base64::Engine;
+            let data = base64::engine::general_purpose::STANDARD.encode(png);
+            blocks.push(ContentBlock::Image(ImageContent::new(data, "image/png")));
+            blocks.push(ContentBlock::Text(TextContent::new(text.clone())));
+        }
     }
     blocks.push(ContentBlock::Text(TextContent::new(context)));
+    remember_photos(&app, &project_name, &attachments).await;
     let response = conn
         .send_request(PromptRequest::new(session, blocks))
         .block_task()
         .await;
+    // Whatever the agent wrote and the tool calls did not name: a turn is
+    // over, so nothing is half-written, and a part left behind in the copy
+    // would be work the user never gets back.
+    if let Some(capture) = capture {
+        let snapshot = capture.parts.lock().unwrap().clone();
+        let names = mcp::changed_parts(&snapshot, &capture.root)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        capture_parts(capture, names, capture_channel).await;
+    }
     // A dialog still open when its turn resolves belongs to no turn now: the
     // UI clears it on its side, so answer it cancelled here too rather than
     // leaving the oneshot pending for the life of the session.
@@ -480,32 +808,19 @@ pub async fn send_prompt(
 /// image capability carries; anything else (a mesh, a PDF) becomes a link the
 /// agent reads from disk itself.
 fn attachment_block(path: &std::path::Path) -> Result<ContentBlock, String> {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .ok_or_else(|| format!("not a file: {}", path.display()))?;
-    let mime = match path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("png") => Some("image/png"),
-        Some("jpg") | Some("jpeg") => Some("image/jpeg"),
-        Some("gif") => Some("image/gif"),
-        Some("webp") => Some("image/webp"),
-        _ => None,
-    };
-    let Some(mime) = mime else {
+    let name = attachment_name(path)?;
+    let Some((mime, data)) = attached_image(path, &name)? else {
+        // A folder is not copied whole; the agent reads it where it is, if it can.
+        let target = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            readable_copy(path, &name)?
+        };
         return Ok(ContentBlock::ResourceLink(ResourceLink::new(
             name,
-            format!("file://{}", path.display()),
+            format!("file://{}", target.display()),
         )));
     };
-    let data = std::fs::read(path).map_err(|e| format!("cannot read {name}: {e}"))?;
-    if data.len() > 10 * 1024 * 1024 {
-        return Err(format!("{name} is too large to attach (over 10MB)"));
-    }
     use base64::Engine;
     Ok(ContentBlock::Image(ImageContent::new(
         base64::engine::general_purpose::STANDARD.encode(data),
@@ -513,9 +828,230 @@ fn attachment_block(path: &std::path::Path) -> Result<ContentBlock, String> {
     )))
 }
 
+/// What the serve reads as a mesh: 3MF by its own reader, the rest through trimesh.
+const MESHES: [&str; 6] = ["3mf", "stl", "obj", "ply", "glb", "off"];
+
+pub(crate) fn is_mesh(path: &std::path::Path) -> bool {
+    !path.is_dir() && attachment_extension(path).is_some_and(|e| MESHES.contains(&e.as_str()))
+}
+
+/// Each attached mesh as the serve describes it, keyed by its path: its
+/// measurements in words and a picture from four sides.
+pub(crate) type Meshes = HashMap<String, (String, Vec<u8>)>;
+
+async fn describe_meshes(app: &tauri::AppHandle, attachments: &[String]) -> Result<Meshes, String> {
+    use tauri::Manager;
+    let mut meshes = Meshes::new();
+    let wanted: Vec<_> = attachments
+        .iter()
+        .filter(|path| is_mesh(Path::new(path)))
+        .collect();
+    if wanted.is_empty() {
+        return Ok(meshes);
+    }
+    let handle = app.clone();
+    let serve = tauri::async_runtime::spawn_blocking(move || {
+        handle.state::<crate::supervisor::Supervisor>().ensure()
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    for path in wanted {
+        let name = attachment_name(Path::new(path))?;
+        let described = mcp::describe_mesh(&serve, path)
+            .await
+            .map_err(|error| format!("cannot read {name}: {error}"))?;
+        meshes.insert(path.clone(), described);
+    }
+    Ok(meshes)
+}
+
+/// A photo outlives the conversation it came in: picking another agent starts a
+/// new session, and find_photos is how that one sees it. The turn itself carries
+/// the photo either way, so a failure here is only worth a log line.
+async fn remember_photos(app: &tauri::AppHandle, project_id: &str, attachments: &[String]) {
+    use tauri::Manager;
+    let photos: Vec<_> = attachments
+        .iter()
+        .filter_map(|path| {
+            let path = std::path::Path::new(path);
+            let name = attachment_name(path).ok()?;
+            let (mime, data) = attached_image(path, &name).ok()??;
+            Some((photo_name(&name, mime), mime, data))
+        })
+        .collect();
+    if photos.is_empty() {
+        return;
+    }
+    let handle = app.clone();
+    let serve = tauri::async_runtime::spawn_blocking(move || {
+        handle.state::<crate::supervisor::Supervisor>().ensure()
+    })
+    .await;
+    let Ok(Ok(serve)) = serve else {
+        eprintln!("[photos] no serve to keep them with");
+        return;
+    };
+    for (name, mime, data) in photos {
+        if let Err(error) = mcp::save_photo(&serve, project_id, name, mime, data).await {
+            eprintln!("[photos] {error}");
+        }
+    }
+}
+
+/// What a photo is kept as. The extension follows the bytes, because a HEIC is
+/// stored as the JPEG it became, and every paste has the same friendly name, so
+/// each gets its own or the newest would replace the rest.
+fn photo_name(name: &str, mime: &str) -> String {
+    let stem = std::path::Path::new(name)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "photo".into());
+    let extension = match mime {
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "jpg",
+    };
+    if stem == crate::PASTED_IMAGE {
+        return format!("{stem}-{}.{extension}", uuid::Uuid::new_v4());
+    }
+    format!("{stem}.{extension}")
+}
+
+/// Run before a turn starts, so a file that cannot go leaves the message in the
+/// composer instead of in the transcript as if it had been sent.
+#[tauri::command]
+pub async fn check_attachments(attachments: Vec<String>, claude: bool) -> Result<(), String> {
+    if claude {
+        // A mesh is drawn when the turn goes out; here it only has to be small
+        // enough to read in reasonable time.
+        let (meshes, rest): (Vec<_>, Vec<_>) = attachments
+            .into_iter()
+            .partition(|path| is_mesh(Path::new(path)));
+        for path in &meshes {
+            let path = Path::new(path);
+            check_copy_size(path, &attachment_name(path)?)?;
+        }
+        return crate::claude::user_content(String::new(), &rest, &Meshes::new()).map(|_| ());
+    }
+    for path in &attachments {
+        let path = std::path::Path::new(path);
+        let name = attachment_name(path)?;
+        if attached_image(path, &name)?.is_none() {
+            check_copy_size(path, &name)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn attachment_name(path: &std::path::Path) -> Result<String, String> {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| format!("not a file: {}", path.display()))
+}
+
+pub(crate) fn attachment_extension(path: &std::path::Path) -> Option<String> {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+}
+
+pub(crate) fn read_attachment(path: &std::path::Path, name: &str) -> Result<Vec<u8>, String> {
+    let size = std::fs::metadata(path)
+        .map_err(|e| format!("cannot read {name}: {e}"))?
+        .len();
+    if size > 10 * 1024 * 1024 {
+        return Err(format!("{name} is too large to attach (over 10MB)"));
+    }
+    std::fs::read(path).map_err(|e| format!("cannot read {name}: {e}"))
+}
+
+/// A photo as a prompt carries it: its type and bytes, or None for any other
+/// file. An iPhone photo is usually HEIC, which no model takes, so the formats
+/// macOS can read but a prompt cannot are converted first.
+pub(crate) fn attached_image(
+    path: &std::path::Path,
+    name: &str,
+) -> Result<Option<(&'static str, Vec<u8>)>, String> {
+    let mime = match attachment_extension(path).as_deref() {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("heic") | Some("heif") | Some("tif") | Some("tiff") | Some("bmp") | Some("avif") => {
+            return converted_to_jpeg(path, name).map(|data| Some(("image/jpeg", data)));
+        }
+        _ => return Ok(None),
+    };
+    read_attachment(path, name).map(|data| Some((mime, data)))
+}
+
+fn converted_to_jpeg(path: &std::path::Path, name: &str) -> Result<Vec<u8>, String> {
+    let dir = attachment_dir(name)?;
+    let out = dir.join("converted.jpg");
+    let converted = std::process::Command::new("/usr/bin/sips")
+        // A phone's HEIC can double as a JPEG at full size, and past this size a
+        // model only downsamples it anyway.
+        .args(["-s", "format", "jpeg", "-Z", "2576"])
+        .arg(path)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .map_err(|e| format!("cannot read {name}: {e}"))?;
+    let data = if converted.status.success() {
+        read_attachment(&out, name)
+    } else {
+        Err(format!("cannot read {name}: it does not open as an image"))
+    };
+    std::fs::remove_dir_all(&dir).ok();
+    data
+}
+
+/// The copy happens before the prompt goes out, where Stop cannot reach it, so a
+/// file too big to copy quickly is refused rather than left to look like a hang.
+fn check_copy_size(path: &std::path::Path, name: &str) -> Result<(), String> {
+    let size = std::fs::metadata(path)
+        .map_err(|e| format!("cannot read {name}: {e}"))?
+        .len();
+    if !path.is_dir() && size > COPY_LIMIT {
+        return Err(format!("{name} is too large to attach (over 500MB)"));
+    }
+    Ok(())
+}
+
+/// The agent's sandbox shuts the folders people keep files in, so it reads a
+/// copy from the temp tree instead. The copy goes in a URI as it stands, so its
+/// name stays plain; the link still shows the real one.
+fn readable_copy(path: &std::path::Path, name: &str) -> Result<PathBuf, String> {
+    check_copy_size(path, name)?;
+    let plain: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || ".-_".contains(c) {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let copy = attachment_dir(name)?.join(plain);
+    std::fs::copy(path, &copy).map_err(|e| format!("cannot read {name}: {e}"))?;
+    Ok(copy)
+}
+
+fn attachment_dir(name: &str) -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join(format!("nurb-attach-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot read {name}: {e}"))?;
+    Ok(dir)
+}
+
 #[tauri::command]
 pub fn cancel_turn(app: tauri::AppHandle, session_id: String) -> Result<(), String> {
     use tauri::Manager;
+    if let Some(driver) = app.state::<crate::claude::Drivers>().get(&session_id) {
+        driver.cancel();
+        return Ok(());
+    }
     let sessions = app.state::<Chats>();
     let sessions = sessions.sessions.lock().unwrap();
     let chat = sessions.get(&session_id).ok_or("chat is not running")?;
@@ -1031,6 +1567,62 @@ fn update_config(
     Some(updated)
 }
 
+/// Codex's full-access mode id, which maps to `danger-full-access` with
+/// approvals `never`.
+const FULL_ACCESS: &str = "agent-full-access";
+
+/// The mode to put a fresh session in, if the agent offers it. Only Codex:
+/// macOS refuses a nested sandbox-exec, so Codex's own sandbox cannot start
+/// inside the app's Seatbelt profile. Every command it wraps dies with exit 71,
+/// and apply_patch has no escalation path, so Codex can never edit a file.
+/// Full access here is still only as wide as the profile the app already
+/// spawned the adapter under.
+fn full_access_mode(kind: AgentKind, modes: Option<&SessionModeState>) -> Option<SessionModeId> {
+    if kind != AgentKind::Codex {
+        return None;
+    }
+    modes?
+        .available_modes
+        .iter()
+        .find(|mode| wire_string(&mode.id) == FULL_ACCESS)
+        .map(|mode| mode.id.clone())
+}
+
+/// Sends session/set_mode when the session offers full access. The app's
+/// Seatbelt profile is the guard, so this is "write only where the app says",
+/// not "write anywhere".
+async fn set_full_access(
+    cx: &ConnectionTo<Agent>,
+    session: &SessionId,
+    kind: AgentKind,
+    modes: Option<&SessionModeState>,
+) {
+    let Some(mode_id) = full_access_mode(kind, modes) else {
+        if kind == AgentKind::Codex {
+            let _ = writeln!(
+                std::io::stderr(),
+                "[chat-session] session mode: {FULL_ACCESS} not offered"
+            );
+        }
+        return;
+    };
+    let sent = cx
+        .send_request(SetSessionModeRequest::new(session.clone(), mode_id))
+        .block_task()
+        .await;
+    let _ = match sent {
+        Ok(_) => writeln!(
+            std::io::stderr(),
+            "[chat-session] session mode: {FULL_ACCESS} set"
+        ),
+        Err(error) => writeln!(
+            std::io::stderr(),
+            "[chat-session] session mode: {FULL_ACCESS} refused ({})",
+            error.message
+        ),
+    };
+}
+
 /// Put the user's remembered picks onto a session the moment it exists, before
 /// the first prompt can go out on the wrong model. A pick the agent no longer
 /// offers (a model dropped from an account's allowlist) is skipped, leaving the
@@ -1104,8 +1696,14 @@ pub async fn refresh_chat_config(
     use tauri::{Emitter, Manager};
     let kind = AgentKind::parse(&agent)?;
     let launcher = app.state::<crate::env::Launcher>().inner().clone();
-    let (_, config, model_rows) =
-        agent_sessions(&launcher, kind, PathBuf::from(path), true).await?;
+    let (_, config, model_rows) = agent_sessions(
+        &launcher,
+        kind,
+        PathBuf::from(path),
+        serve_entry(&app, false).await,
+        true,
+    )
+    .await?;
     let prefs = app.state::<PrefStore>();
     prefs.replace_cache(kind.id(), config);
     if kind == AgentKind::Grok {
@@ -1125,6 +1723,14 @@ pub fn chat_config(
 ) -> Result<Vec<ConfigRow>, String> {
     use tauri::Manager;
     let kind = AgentKind::parse(&agent)?;
+    if kind == AgentKind::Claude {
+        if let Some(id) = session_id.as_ref() {
+            if let Some(driver) = app.state::<crate::claude::Drivers>().get(id) {
+                return Ok(driver.config());
+            }
+        }
+        return Ok(crate::claude::config_rows(&app.state::<PrefStore>()));
+    }
     if let Some(id) = session_id {
         let sessions = app.state::<Chats>();
         let sessions = sessions.sessions.lock().unwrap();
@@ -1136,6 +1742,34 @@ pub fn chat_config(
         }
     }
     Ok(app.state::<PrefStore>().rows(kind.id()))
+}
+
+/// The picker looking at an agent this project has never run: rows from the
+/// cache when it has them, else one throwaway session asks the agent what it
+/// offers, exactly as `list_sessions` does for every agent at once. The error
+/// is the user's answer (a signed-out Codex says so), not a silent empty list.
+#[tauri::command]
+pub async fn probe_chat_config(
+    app: tauri::AppHandle,
+    agent: String,
+    path: String,
+) -> Result<Vec<ConfigRow>, String> {
+    use tauri::Manager;
+    let kind = AgentKind::parse(&agent)?;
+    let cached = app.state::<PrefStore>().rows(kind.id());
+    if !cached.is_empty() {
+        return Ok(cached);
+    }
+    let launcher = app.state::<crate::env::Launcher>().inner().clone();
+    let serve = serve_entry(&app, false).await;
+    let (_, config, model_rows) =
+        agent_sessions(&launcher, kind, PathBuf::from(path), serve, true).await?;
+    let prefs = app.state::<PrefStore>();
+    prefs.cache(kind.id(), config);
+    if kind == AgentKind::Grok {
+        prefs.cache_model_rows(kind.id(), model_rows);
+    }
+    Ok(prefs.rows(kind.id()))
 }
 
 /// Remember a pick and, when a session is running, move it there now. The
@@ -1153,6 +1787,31 @@ pub async fn set_chat_config(
 ) -> Result<Vec<ConfigRow>, String> {
     use tauri::Manager;
     let kind = AgentKind::parse(&agent)?;
+    if kind == AgentKind::Claude {
+        let available = crate::claude::config_rows(&app.state::<PrefStore>());
+        if !available.iter().any(|row| {
+            row.category == category && row.options.iter().any(|choice| choice.value == value)
+        }) {
+            return Err("This choice is no longer available. Refresh the model menu.".into());
+        }
+        let driver = session_id
+            .as_ref()
+            .and_then(|id| app.state::<crate::claude::Drivers>().get(id));
+        let rows = if let Some(driver) = driver {
+            driver
+                .set_config(category.clone(), value.clone(), available)
+                .await?
+        } else if session_id.is_some() {
+            return Err("chat is not running".into());
+        } else {
+            app.state::<PrefStore>()
+                .remember(kind.id(), &category, &value);
+            return Ok(crate::claude::config_rows(&app.state::<PrefStore>()));
+        };
+        app.state::<PrefStore>()
+            .remember(kind.id(), &category, &value);
+        return Ok(rows);
+    }
     let live = session_id
         .map(|id| {
             let sessions = app.state::<Chats>();
@@ -1227,7 +1886,13 @@ pub async fn set_chat_config(
 #[tauri::command]
 pub fn cancel_chat_start(app: tauri::AppHandle, startup_id: String) {
     use tauri::Manager;
-    if let Some(cancel) = app.state::<Chats>().starting.lock().unwrap().remove(&startup_id) {
+    if let Some(cancel) = app
+        .state::<Chats>()
+        .starting
+        .lock()
+        .unwrap()
+        .remove(&startup_id)
+    {
         let _ = cancel.send(());
     }
 }
@@ -1235,6 +1900,7 @@ pub fn cancel_chat_start(app: tauri::AppHandle, startup_id: String) {
 #[tauri::command]
 pub fn close_chat(app: tauri::AppHandle, session_id: String) {
     use tauri::Manager;
+    app.state::<crate::claude::Drivers>().remove(&session_id);
     // Dropping the entry drops the close sender; the connection task sees it,
     // returns, and kills the adapter's process group.
     app.state::<Chats>()
@@ -1258,25 +1924,67 @@ async fn run_chat(
     ready_tx: oneshot::Sender<Ready>,
     close_tx: oneshot::Sender<()>,
     close_rx: oneshot::Receiver<()>,
-    mut startup_rx: oneshot::Receiver<()>,
+    startup_rx: oneshot::Receiver<()>,
+    initial_config: Option<HashMap<String, String>>,
 ) {
     use tauri::Manager;
-    let launcher = app.state::<crate::env::Launcher>();
+    let cancelled = startup_cancelled(startup_rx);
+    tokio::pin!(cancelled);
+    // The tools have to be on the session request, so the serve is started
+    // before the adapter rather than alongside it.
+    let serve =
+        tokio::select! { result = serve_entry(&app, true) => result, _ = &mut cancelled => return };
+    let launcher = app.state::<crate::env::Launcher>().inner().clone();
+    let data = app.state::<crate::AppData>().0.clone();
+    // Whether this agent can reach the tools decides where it works, so it is
+    // settled before the adapter that will do the work is even spawned.
+    let capture = match tokio::select! { result = working_folder(&launcher, kind, &project, &data, serve.as_ref(), &channel) => result, _ = &mut cancelled => return }
+    {
+        Ok(capture) => capture,
+        Err(message) => {
+            let failed = ChatEvent::SessionError {
+                message: message.clone(),
+            };
+            events::mirror(&failed);
+            let _ = channel.send(failed);
+            let mut error = agent_client_protocol::Error::internal_error();
+            error.message = message;
+            let _ = ready_tx.send(Err(error));
+            return;
+        }
+    };
+    // A saved session was created in the project folder; loading it with the
+    // checkout as cwd leaves the agent's own sandbox on the old workspace and
+    // every file write is refused, so the folder path always starts fresh.
+    let resume = if capture.is_some() { None } else { resume };
+    let cwd = match &capture {
+        Some(capture) => mcp::session_cwd(false, &project, &capture.root),
+        None => project.clone(),
+    };
     let mut mcp_snapshot = match app.state::<crate::mcp::McpStore>().snapshot() {
         Ok(snapshot) => snapshot,
-        Err(message) => { let _ = ready_tx.send(Err(agent_client_protocol::Error::new(-32603, message))); return; }
+        Err(message) => {
+            let _ = ready_tx.send(Err(agent_client_protocol::Error::new(-32603, message)));
+            return;
+        }
     };
-    let browser_setup = crate::mcp::prepare_presets(&mut mcp_snapshot.1, &launcher, crate::mcp::PresetPurpose::Conversation);
+    let browser_setup = crate::mcp::prepare_presets(
+        &mut mcp_snapshot.1,
+        &launcher,
+        crate::mcp::PresetPurpose::Conversation,
+    );
     let _mcp_browsers = tokio::select! {
         result = browser_setup => match result {
             Ok(browsers) => browsers,
             Err(message) => { let _ = ready_tx.send(Err(agent_client_protocol::Error::new(-32603, message))); return; }
         },
-        _ = &mut startup_rx => return,
+        _ = &mut cancelled => return,
     };
-    let mcp_path = launcher.adapter_path().unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+    let mcp_path = launcher
+        .adapter_path()
+        .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
     let (program, args) = launcher.adapter(kind);
-    let (program, args) = sandbox::wrap(program, args, &project, &launcher.engine_root());
+    let (program, args) = sandbox::wrap(program, args, &cwd, &launcher.engine_root());
     let mut config = AcpAgentConfig::new(program).args(args);
     if let Some(path) = launcher.adapter_path() {
         config = config.env("PATH", path);
@@ -1286,7 +1994,9 @@ async fn run_chat(
             config = config.env("GEMINI_API_KEY", key);
         }
     }
-    let _ = channel.send(ChatEvent::Activity { phase: format!("Launching {}", kind.label()) });
+    let _ = channel.send(ChatEvent::Activity {
+        phase: format!("Launching {}", kind.label()),
+    });
     let agent = AcpAgent::new(config);
     let (stdin, stdout, stderr, child) = match agent.spawn_process() {
         Ok(spawned) => spawned,
@@ -1306,6 +2016,8 @@ async fn run_chat(
     let notify_replaying = Arc::clone(&replaying);
     let notify_channel = channel.clone();
     let notify_app = app.clone();
+    let notify_capture = capture.clone();
+    let chat_capture = capture.clone();
     let ask_channel = channel.clone();
     let ask_pending = pending.clone();
     let live_session = Arc::new(Mutex::new(None));
@@ -1334,6 +2046,16 @@ async fn run_chat(
                     use tauri::Emitter;
                     notify_app.state::<PrefStore>().replace_cache(kind.id(), updated);
                     let _ = notify_app.emit("agent-config", ());
+                }
+                // A part the agent just finished writing goes back to the
+                // project now, not only at the end of the turn: the viewer
+                // should move while the user is watching.
+                if let Some(capture) = notify_capture.clone() {
+                    let names = mcp::completed_parts(&notification.update, &capture.root);
+                    if !names.is_empty() {
+                        let channel = notify_channel.clone();
+                        tokio::spawn(capture_parts(capture, names, channel));
+                    }
                 }
                 forward(
                     &notify_channel,
@@ -1406,12 +2128,14 @@ async fn run_chat(
                 let ready_tx = ready_tx.take().expect("main_fn runs once");
                 let close_tx = close_tx.take().expect("main_fn runs once");
                 let connected_session = Arc::clone(&connected_session);
+                let chat_capture = chat_capture.clone();
                 let load_replaying = Arc::clone(&replaying);
                 let resume = resume.clone();
                 let chat_app = chat_app.clone();
                 let chat_project = chat_project.clone();
                 let chat_pending = chat_pending.clone();
                 let chat_channel = chat_channel.clone();
+                let initial_config = initial_config.clone();
                 let mcp_snapshot = mcp_snapshot.clone();
                 let mcp_path = mcp_path.clone();
                 let mcp_attached = Arc::new(Mutex::new((Vec::new(), Vec::new())));
@@ -1423,11 +2147,16 @@ async fn run_chat(
                             .send_request(InitializeRequest::new(ProtocolVersion::V1))
                             .block_task()
                             .await?;
-                        let (mcp_servers, attached, unsupported) = crate::mcp::agent_servers(&mcp_snapshot.1, &init.agent_capabilities.mcp_capabilities, &mcp_path);
+                        let (mut mcp_servers, attached, unsupported) = crate::mcp::agent_servers(&mcp_snapshot.1, &init.agent_capabilities.mcp_capabilities, &mcp_path);
                         if !unsupported.is_empty() { let _ = chat_channel.send(ChatEvent::Note { text: "Some MCP servers could not be attached. Open MCPs to check transport support and executable paths.".into() }); }
                         *mcp_attached.lock().unwrap() = (attached, unsupported);
+                        // codex-acp forgets a loaded session's MCP servers
+                        // unless they are sent again, so both paths carry it.
+                        let entry =
+                            mcp_entry(&init.agent_capabilities.mcp_capabilities, serve.as_ref());
+                        if let Some(entry) = entry { mcp_servers.insert(0, entry); }
                         let menus = grok_model_menus(init.meta.as_ref()).unwrap_or_default();
-                        let chosen = chat_app.state::<PrefStore>().chosen(kind.id());
+                        let chosen = initial_config.map(|values| crate::prefs::SHOWN.iter().filter_map(|category| values.get(*category).map(|value| ((*category).to_string(), value.clone()))).collect()).unwrap_or_else(|| chat_app.state::<PrefStore>().chosen(kind.id()));
                         let open_meta = grok_open_meta(kind, &chosen);
                         if let Some(id) = resume {
                             // Restore chain: session/load replays the whole
@@ -1443,7 +2172,7 @@ async fn run_chat(
                                 let _ = chat_channel.send(ChatEvent::Activity { phase: "Loading conversation history".into() });
                                 load_replaying.store(true, Ordering::Relaxed);
                                 let mut request =
-                                    LoadSessionRequest::new(requested.clone(), project.clone()).mcp_servers(mcp_servers.clone());
+                                    LoadSessionRequest::new(requested.clone(), cwd.clone()).mcp_servers(mcp_servers.clone());
                                 if let Some(meta) = open_meta.clone() {
                                     request = request.meta(meta);
                                 }
@@ -1457,6 +2186,7 @@ async fn run_chat(
                                             loaded.meta.as_ref(),
                                             init.meta.as_ref(),
                                         ),
+                                        loaded.modes,
                                     )
                                 })
                             } else {
@@ -1468,6 +2198,8 @@ async fn run_chat(
                                         std::io::stderr(),
                                         "[chat-session] restore path: session/load ok ({id})"
                                     );
+                                    set_full_access(&cx, &session.0, kind, session.2.as_ref())
+                                        .await;
                                     return Ok((session.0, session.1, menus, chosen));
                                 }
                                 Err(error) => {
@@ -1486,25 +2218,28 @@ async fn run_chat(
                             }
                         }
                         let _ = chat_channel.send(ChatEvent::Activity { phase: "Opening conversation".into() });
-                        let mut request = NewSessionRequest::new(project).mcp_servers(mcp_servers);
+                        let mut request = NewSessionRequest::new(cwd).mcp_servers(mcp_servers);
                         if let Some(meta) = open_meta {
                             request = request.meta(meta);
                         }
-                        cx.send_request(request)
-                            .block_task()
-                            .await
-                            .map(|new_session| {
-                                (
-                                    new_session.session_id,
-                                    picker_rows(
-                                        &new_session.config_options.unwrap_or_default(),
-                                        new_session.meta.as_ref(),
-                                        init.meta.as_ref(),
-                                    ),
-                                    menus,
-                                    chosen,
-                                )
-                            })
+                        let new_session = cx.send_request(request).block_task().await?;
+                        set_full_access(
+                            &cx,
+                            &new_session.session_id,
+                            kind,
+                            new_session.modes.as_ref(),
+                        )
+                        .await;
+                        Ok((
+                            new_session.session_id,
+                            picker_rows(
+                                &new_session.config_options.unwrap_or_default(),
+                                new_session.meta.as_ref(),
+                                init.meta.as_ref(),
+                            ),
+                            menus,
+                            chosen,
+                        ))
                     }
                     .await;
                     let session_id = match session {
@@ -1543,6 +2278,7 @@ async fn run_chat(
                                     channel: chat_channel,
                                     config: session_config,
                                     grok_models: menus,
+                                    checkout: chat_capture,
                                     pgid,
                                     _close: close_tx,
                                 },
@@ -1574,7 +2310,7 @@ async fn run_chat(
         );
     let (was_cancelled, result) = tokio::select! {
         result = connection => (false, result),
-        _ = startup_cancelled(startup_rx) => (true, Ok(live_session.lock().unwrap().clone())),
+        _ = &mut cancelled => (true, Ok(live_session.lock().unwrap().clone())),
     };
 
     // Whichever way the connection ended, take the process tree with it.
@@ -1588,14 +2324,18 @@ async fn run_chat(
         );
     }
     let live_session = live_session.lock().unwrap().clone();
-    if let Some(id) = &live_session { app.state::<crate::mcp::McpStore>().forget_session(id); }
+    if let Some(id) = &live_session {
+        app.state::<crate::mcp::McpStore>().forget_session(id);
+    }
     if let Some(session_id) = session_to_remove(&result, &live_session) {
         app.state::<Chats>()
             .sessions
             .lock()
             .unwrap()
             .remove(&session_id);
-        if was_cancelled { return; }
+        if was_cancelled {
+            return;
+        }
         let error = ChatEvent::SessionError {
             message: format!(
                 "{} stopped unexpectedly. Send a message to start a fresh chat.",
@@ -1679,24 +2419,55 @@ fn friendly(kind: AgentKind, error: agent_client_protocol::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_a_probe_stops_its_process_group() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = tokio::process::Command::new("/bin/sleep")
+            .arg("60")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let guard = super::ProbeProcess(Some(child.id().unwrap() as i32));
+        drop(guard);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
     #[test]
     fn startup_cancellation_is_explicit_and_completed_tokens_do_not_kill_sessions() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let (sender, receiver) = tokio::sync::oneshot::channel();
             sender.send(()).unwrap();
-            assert!(tokio::time::timeout(std::time::Duration::from_millis(20), super::startup_cancelled(receiver)).await.is_ok());
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                super::startup_cancelled(receiver)
+            )
+            .await
+            .is_ok());
             let (sender, receiver) = tokio::sync::oneshot::channel();
             drop(sender);
-            assert!(tokio::time::timeout(std::time::Duration::from_millis(20), super::startup_cancelled(receiver)).await.is_err());
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                super::startup_cancelled(receiver)
+            )
+            .await
+            .is_err());
         });
     }
 
     use super::{
-        attachment_block, friendly, grok_open_meta, grok_rows, picker_rows, rows, with_grok_choice,
-        AgentKind,
+        attachment_block, friendly, full_access_mode, grok_open_meta, grok_rows, picker_rows, rows,
+        with_grok_choice, AgentKind,
     };
-    use agent_client_protocol::schema::v1::{ContentBlock, Meta, SessionConfigOption};
+    use agent_client_protocol::schema::v1::{
+        ContentBlock, Meta, SessionConfigOption, SessionMode, SessionModeState,
+    };
 
     /// The exact message a revoked token produces (#115): an internal error,
     /// not -32000, so only the message can route it to the sign-in button.
@@ -1709,9 +2480,8 @@ mod tests {
         assert!(friendly(AgentKind::Claude, error).starts_with("auth_required:"));
     }
 
-    /// What claude-agent-acp 0.64.2 actually answers session/new with, captured
-    /// off the wire. Mode, fast, and agent ride along and must not reach the
-    /// picker.
+    /// What Claude actually answers session/new with, captured off the wire.
+    /// Mode, fast, and agent ride along and must not reach the picker.
     const CLAUDE: &str = r#"[
       {"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"default",
        "options":[{"value":"default","name":"Default"},{"value":"plan","name":"Plan"}]},
@@ -2021,10 +2791,107 @@ mod tests {
             other => panic!("expected a resource link, got {other:?}"),
         }
 
+        // The agent's sandbox shuts Desktop, Documents and Downloads, so what it
+        // reads is a copy in the temp tree it is allowed to read.
+        let spaced = scratch("My Bracket (v2).3mf", b"zip bytes");
+        match attachment_block(&spaced).unwrap() {
+            ContentBlock::ResourceLink(link) => {
+                assert_eq!(link.name, "My Bracket (v2).3mf");
+                let copy = link.uri.strip_prefix("file://").unwrap();
+                assert_ne!(std::path::Path::new(copy), spaced);
+                assert!(copy.starts_with(&*std::env::temp_dir().to_string_lossy()));
+                assert!(!copy.contains(' '), "{copy}");
+                assert_eq!(std::fs::read(copy).unwrap(), b"zip bytes");
+            }
+            other => panic!("expected a resource link, got {other:?}"),
+        }
+
+        // A format no prompt takes arrives as a JPEG, not as a link to itself.
+        use base64::Engine;
+        let tiny = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC")
+            .unwrap();
+        let png = scratch("tiny.png", &tiny);
+        let tiff = png.with_file_name("tiny.tiff");
+        assert!(std::process::Command::new("/usr/bin/sips")
+            .args(["-s", "format", "tiff"])
+            .arg(&png)
+            .arg("--out")
+            .arg(&tiff)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        match attachment_block(&tiff).unwrap() {
+            ContentBlock::Image(image) => assert_eq!(image.mime_type, "image/jpeg"),
+            other => panic!("expected an image block, got {other:?}"),
+        }
+        let broken = scratch("broken.heic", b"not a photo");
+        assert!(attachment_block(&broken)
+            .unwrap_err()
+            .contains("broken.heic"));
+
+        // Too big to copy is refused by name, before any bytes move.
+        let giant = scratch("giant.3mf", b"");
+        std::fs::File::options()
+            .write(true)
+            .open(&giant)
+            .unwrap()
+            .set_len(super::COPY_LIMIT + 1)
+            .unwrap();
+        assert!(attachment_block(&giant).unwrap_err().contains("too large"));
+        std::fs::remove_file(&giant).unwrap();
+
+        // A folder is linked where it is: it cannot be copied like a file.
+        let folder = spaced.parent().unwrap();
+        match attachment_block(folder).unwrap() {
+            ContentBlock::ResourceLink(link) => {
+                assert_eq!(link.uri, format!("file://{}", folder.display()));
+            }
+            other => panic!("expected a resource link, got {other:?}"),
+        }
+
         let missing = std::path::Path::new("/nowhere/gone.png");
         assert!(attachment_block(missing).unwrap_err().contains("gone.png"));
 
         let huge = scratch("huge.png", &vec![0u8; 10 * 1024 * 1024 + 1]);
         assert!(attachment_block(&huge).unwrap_err().contains("too large"));
+    }
+
+    #[test]
+    fn a_kept_photo_is_named_for_its_bytes_and_pastes_stay_apart() {
+        assert_eq!(super::photo_name("hook.PNG", "image/png"), "hook.png");
+        assert_eq!(
+            super::photo_name("IMG_0001.HEIC", "image/jpeg"),
+            "IMG_0001.jpg"
+        );
+        let paste = |_| super::photo_name("pasted-image.png", "image/png");
+        let (one, two) = (paste(1), paste(2));
+        assert_ne!(one, two);
+        assert!(one.starts_with("pasted-image-") && one.ends_with(".png"));
+    }
+
+    /// Only Codex gets full access, and only when the adapter offers it: the
+    /// app's Seatbelt profile is the guard, and Codex's own sandbox cannot nest
+    /// inside it.
+    #[test]
+    fn full_access_is_codex_only() {
+        let offered = SessionModeState::new(
+            "agent",
+            vec![
+                SessionMode::new("read-only", "Read only"),
+                SessionMode::new("agent", "Agent"),
+                SessionMode::new("agent-full-access", "Full access"),
+            ],
+        );
+        let plain = SessionModeState::new("agent", vec![SessionMode::new("agent", "Agent")]);
+
+        assert_eq!(
+            full_access_mode(AgentKind::Codex, Some(&offered)).map(|id| id.to_string()),
+            Some("agent-full-access".to_string())
+        );
+        assert!(full_access_mode(AgentKind::Codex, Some(&plain)).is_none());
+        assert!(full_access_mode(AgentKind::Codex, None).is_none());
+        assert!(full_access_mode(AgentKind::Claude, Some(&offered)).is_none());
     }
 }

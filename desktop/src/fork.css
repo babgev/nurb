@@ -1,0 +1,25 @@
+/* Fork controls share the upstream palette and typography. */
+:root {
+  --bg: var(--color-ground); --panel: var(--color-ground); --panel2: var(--color-raised); --bad: var(--color-fail); --text: var(--color-ink);
+  --dim: var(--color-muted); --dimmer: var(--color-faint); --line: var(--color-line); --hover: var(--color-raised);
+  --active: var(--color-raised); --accent: var(--color-accent); --sans: var(--font-sans); --mono: var(--font-mono);
+}
+.fork-chat { display: flex; flex-direction: column; flex: 0 0 372px; width: 372px; min-width: 0; min-height: 0; overflow: hidden; }
+.fork-chat[hidden] { display: none; }
+.fork-chat > section { flex: 1; min-height: 0; }
+.fork-tool { font: 11px var(--font-mono); color: var(--color-muted); border: 1px solid var(--color-line); border-radius: 5px; padding: 7px; }
+.fork-tool summary { cursor: pointer; display: flex; justify-content: space-between; gap: 8px; }
+.fork-tool summary span:first-child { min-width: 0; overflow-wrap: anywhere; }
+.fork-tool summary span:last-child { flex-shrink: 0; }
+.fork-tool pre { max-height: 240px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding-top: 8px; }
+.fork-activity { color: var(--color-muted); font: 11px var(--font-mono); }
+.fork-activity > div { display: flex; justify-content: space-between; gap: 8px; }
+.fork-activity strong { font-weight: 500; overflow-wrap: anywhere; }
+.fork-activity p { margin: 5px 0; }
+.fork-activity button { text-decoration: underline; cursor: pointer; }
+
+.fork-chat > .conversation-tabs-wrap { margin: 0; padding: 5px 6px; min-height: 38px; }
+
+.mcp-panel { box-shadow: var(--shadow-panel); }
+.mcp-error { background: var(--color-fail-wash); color: var(--color-fail); }
+.mcp-state-mark.error { color: var(--color-fail); }

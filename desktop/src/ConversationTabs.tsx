@@ -31,7 +31,7 @@ export default function ConversationTabs({ tabs, selected, busy, closed, onSelec
           event.preventDefault();
           const offset = event.key === "ArrowRight" ? 1 : -1;
           onSelect(tabs[(index + offset + tabs.length) % tabs.length].id);
-          requestAnimationFrame(() => document.querySelector<HTMLButtonElement>('.chat:not(.chat-hidden) [role="tab"][aria-selected="true"]')?.focus());
+          requestAnimationFrame(() => stripRef.current?.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]')?.focus());
         }}>
           <span className={`conversation-tab-dot ${busy[tab.id] ? "working" : tab.unseen ? "unread" : ""}`} />
           <span className="conversation-tab-name">{tab.model ?? tab.agent ?? "New chat"}</span>

@@ -402,6 +402,11 @@ pub fn agent_servers(
     let mut attached = Vec::new();
     let mut unsupported = Vec::new();
     for server in configs {
+        // The built-in CAD connection always owns this name.
+        if server.name.eq_ignore_ascii_case("nurb") {
+            unsupported.push(server.id.clone());
+            continue;
+        }
         let wire = match server.transport.as_str() {
             "stdio" => resolve_command(&server.command, path).ok().map(|command| {
                 McpServer::Stdio(
@@ -435,6 +440,78 @@ pub fn agent_servers(
         }
     }
     (servers, attached, unsupported)
+}
+
+/// Native Claude uses the same resolved configurations as ACP, serialized in
+/// its CLI shape. Names must form one exact tool prefix, never an allowlist glob.
+pub fn native_servers(
+    configs: &[ServerConfig],
+    path: &str,
+) -> (serde_json::Map<String, Value>, Vec<String>, Vec<String>) {
+    let mut entries = serde_json::Map::new();
+    let mut attached = Vec::new();
+    let mut unsupported = Vec::new();
+    for server in configs {
+        if server.name.eq_ignore_ascii_case("nurb")
+            || !server
+                .name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            unsupported.push(server.id.clone());
+            continue;
+        }
+        let entry = match server.transport.as_str() {
+            "stdio" => resolve_command(&server.command, path).ok().map(|command| json!({ "type": "stdio", "command": command, "args": server.args, "env": server.env })),
+            "http" => Some(json!({ "type": "http", "url": server.url, "headers": server.headers })),
+            _ => None,
+        };
+        if let Some(entry) = entry {
+            entries.insert(server.name.clone(), entry);
+            attached.push(server.id.clone());
+        } else {
+            unsupported.push(server.id.clone());
+        }
+    }
+    (entries, attached, unsupported)
+}
+
+/// A session's CLI config carries credentials; pass a private filename instead
+/// of putting its contents into process arguments. The guard removes it on close.
+pub struct NativeConfigFile(PathBuf);
+impl NativeConfigFile {
+    pub fn create(root: &Path, value: &Value) -> Result<Self, String> {
+        let directory = root.join("mcp");
+        std::fs::create_dir_all(&directory)
+            .map_err(|_| "Cannot create MCP configuration folder.".to_string())?;
+        let path = directory.join(format!("session-{}.json", uuid::Uuid::new_v4()));
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&path)
+            .map_err(|_| "Cannot create private MCP configuration.".to_string())?;
+        let guard = Self(path);
+        file.write_all(
+            serde_json::to_string(value)
+                .map_err(|_| "Cannot encode MCP configuration.".to_string())?
+                .as_bytes(),
+        )
+        .map_err(|_| "Cannot write MCP configuration.".to_string())?;
+        Ok(guard)
+    }
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+impl Drop for NativeConfigFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 #[tauri::command]
@@ -1109,6 +1186,159 @@ mod tests {
             url: String::new(),
             headers: BTreeMap::new(),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "requires local Chrome, Node and the pinned Playwright MCP runtime"]
+    async fn real_browser_mcp_uses_native_config_and_current_sandbox() {
+        use tokio::io::AsyncReadExt;
+        let root = Scratch::new();
+        let launcher = crate::env::Launcher::Checkout {
+            repo: root.0.clone(),
+        };
+        let mut configs = vec![browser_config(&launcher, false).unwrap()];
+        let browsers = prepare_presets(&mut configs, &launcher, PresetPurpose::Conversation)
+            .await
+            .unwrap();
+        let path = crate::env::user_path();
+        let (entries, attached, unsupported) = native_servers(&configs, path);
+        assert_eq!(attached, vec!["browser"]);
+        assert!(unsupported.is_empty());
+        let file = NativeConfigFile::create(&root.0, &json!({ "mcpServers": entries })).unwrap();
+        let native: Value = serde_json::from_slice(&std::fs::read(file.path()).unwrap()).unwrap();
+        let server = &native["mcpServers"]["Browser"];
+        let (program, args) = crate::acp::sandbox::wrap(
+            server["command"].as_str().unwrap().into(),
+            server["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|arg| arg.as_str().unwrap().to_string())
+                .collect(),
+            &root.0,
+            &root.0,
+        );
+        let mut command = tokio::process::Command::new(program);
+        command
+            .args(args)
+            .current_dir(&root.0)
+            .env("PATH", path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .process_group(0);
+        let child = command.spawn().unwrap();
+        let mut child = ChildGroup {
+            pgid: child.id().unwrap() as i32,
+            child,
+        };
+        let mut writer = child.child.stdin.take().unwrap();
+        let mut reader = BufReader::new(child.child.stdout.take().unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = [0u8; 2048];
+                let _ = socket.read(&mut buffer).await;
+                let page = "<!doctype html><title>Nurb Browser integration</title><h1>Browser connection verified</h1>";
+                let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", page.len(), page);
+                let _ = socket.write_all(reply.as_bytes()).await;
+            }
+        });
+        let check = tokio::time::timeout(Duration::from_secs(90), async {
+            write_line(&mut writer, &initialize()).await.unwrap();
+            let init = read_response(&mut reader, &mut writer, 1).await.unwrap();
+            protocol(&init).unwrap();
+            write_line(&mut writer, &initialized()).await.unwrap();
+            write_line(&mut writer, &tool_request(2, None)).await.unwrap();
+            let tools = read_response(&mut reader, &mut writer, 2).await.unwrap();
+            assert!(tools["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "browser_navigate"));
+            write_line(&mut writer, &json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"browser_navigate","arguments":{"url":format!("http://{address}/")}}})).await.unwrap();
+            let page = read_response(&mut reader, &mut writer, 3).await.unwrap();
+            assert_ne!(page["isError"], true, "{page}");
+            let inline = page.to_string();
+            let output = browsers[0].output_dir();
+            let saved = std::fs::read_dir(output).unwrap().filter_map(Result::ok)
+                .filter_map(|entry| std::fs::read_to_string(entry.path()).ok()).collect::<Vec<_>>().join("\n");
+            assert!(inline.contains("Browser connection verified") || saved.contains("Browser connection verified"), "{page}");
+            eprintln!("Browser MCP native-config smoke: initialize, {} tools, local navigation passed", tools["tools"].as_array().unwrap().len());
+        }).await;
+        fixture.abort();
+        drop(writer);
+        drop(child);
+        let config_path = file.path().to_path_buf();
+        drop(file);
+        assert!(!config_path.exists());
+        drop(browsers);
+        for _ in 0..100 {
+            if std::fs::read_dir(root.0.join("mcp/browser-profiles"))
+                .unwrap()
+                .next()
+                .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(std::fs::read_dir(root.0.join("mcp/browser-profiles"))
+            .unwrap()
+            .next()
+            .is_none());
+        check.expect("Browser MCP initialization or navigation timed out");
+    }
+
+    #[test]
+    fn native_mcp_supports_both_transports_without_overriding_cad_or_allowing_globs() {
+        let mut local = server();
+        local.name = "Browser".into();
+        let mut remote = server();
+        remote.id = "remote".into();
+        remote.name = "Remote".into();
+        remote.transport = "http".into();
+        remote.url = "https://example.test/mcp".into();
+        remote
+            .headers
+            .insert("Authorization".into(), "Bearer private".into());
+        let mut reserved = server();
+        reserved.id = "reserved".into();
+        reserved.name = "nurb".into();
+        let mut glob = server();
+        glob.id = "glob".into();
+        glob.name = "*".into();
+        let (entries, attached, unsupported) =
+            native_servers(&[local, remote, reserved, glob], "/usr/bin");
+        assert_eq!(attached, ["test", "remote"]);
+        assert_eq!(unsupported, ["reserved", "glob"]);
+        assert_eq!(entries["Browser"]["command"], "/usr/bin/python3");
+        assert_eq!(
+            entries["Remote"]["headers"]["Authorization"],
+            "Bearer private"
+        );
+        assert!(!entries.contains_key("nurb"));
+    }
+
+    #[test]
+    fn native_session_config_is_private_and_removed_when_closed() {
+        let root = Scratch::new();
+        let guard = NativeConfigFile::create(&root.0, &json!({ "token": "private" })).unwrap();
+        let path = guard.path().to_path_buf();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"token\":\"private\"}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(guard);
+        assert!(!path.exists());
     }
 
     #[test]

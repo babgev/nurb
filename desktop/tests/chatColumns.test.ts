@@ -5,6 +5,11 @@ import {
   closeChatTab,
   markChatSeen,
   readChatTabs,
+  readDurableChatTabs,
+  pinChatProviders,
+  renameChatColumn,
+  renameChatSelection,
+  migrateChatTabs,
   selectedChat,
   updateChatActivity,
   type ChatColumn,
@@ -12,6 +17,18 @@ import {
 
 const fresh = (id = "first", path = "/projects/alpha"): ChatColumn => ({
   id, path, part: "bracket", agent: "claude", resume: null, unseen: false,
+});
+
+test("blank and closed tabs retain their original provider and model when the default changes", () => {
+  const blank = { ...fresh(), agent: null, model: "Claude default", config: { model: "default" }, draft: { text: "Keep this", files: [] } };
+  const pinned = pinChatProviders([blank, fresh("existing")], "claude");
+  const changedDefault = pinChatProviders(pinned, "codex");
+  assert.equal(changedDefault[0].agent, "claude");
+  assert.equal(changedDefault[0].model, "Claude default");
+  assert.deepEqual(changedDefault[0].config, blank.config);
+  assert.deepEqual(changedDefault[0].draft, blank.draft);
+  assert.equal(changedDefault[1], pinned[1]);
+  assert.equal(pinChatProviders([{ ...blank, legacyAgent: "gemini" }], "codex")[0].agent, "gemini");
 });
 
 test("busy state and unread completion belong to one tab, not its siblings", () => {
@@ -92,4 +109,50 @@ test("corrupt storage and stale or cross-project selections are ignored safely",
   const parsed = readChatTabs(JSON.stringify({ columns: [fresh(), fresh(), { id: 5 }], selected: { [chatKey("/projects/beta", "bracket")]: "first" } }));
   assert.equal(parsed.columns.length, 1);
   assert.deepEqual(parsed.selected, {});
+});
+
+
+test("part rename keeps every tab, draft, and session without remounting", () => {
+  const first = { ...fresh(), resume: "running", draft: { text: "Pending", files: [] } };
+  const second = fresh("second");
+  const existing = { ...fresh("existing"), part: "renamed" };
+  const next = renameChatColumn([first, second, existing], first.path, first.part, "renamed");
+  assert.deepEqual(next.map((tab) => tab.id), ["first", "second", "existing"]);
+  assert.ok(next.every((tab) => tab.part === "renamed"));
+  assert.equal(next[0].resume, "running");
+  assert.deepEqual(next[0].draft, first.draft);
+  assert.deepEqual(renameChatSelection({ [chatKey(first.path, first.part)]: second.id }, first.path, first.part, "renamed"), { [chatKey(first.path, "renamed")]: second.id });
+});
+
+test("legacy migration keeps history metadata and is idempotent without resuming old provider sessions", () => {
+  const old = { ...fresh(), resume: "old-provider-session", config: { model: "opus", thought_level: "high" }, draft: { text: "Unsent", files: ["reference.png"] } };
+  const state = { columns: [old], selected: { [chatKey(old.path, old.part)]: old.id } };
+  const paths = { [old.path]: "/library/projects/new-id" };
+  const migrated = migrateChatTabs(state, paths);
+  assert.equal(migrated.columns[0].resume, null);
+  assert.equal(migrated.columns[0].legacySession, old.resume);
+  assert.equal(migrated.columns[0].legacyPath, old.path);
+  assert.equal(migrated.columns[0].legacyAgent, "claude");
+  assert.deepEqual(migrated.columns[0].draft, old.draft);
+  assert.deepEqual(migrated.columns[0].config, old.config);
+  assert.equal(migrated.selected[chatKey(paths[old.path], old.part)], old.id);
+  assert.deepEqual(migrateChatTabs(migrated, paths), migrated);
+  assert.equal(state.columns[0].resume, "old-provider-session");
+});
+
+test("saved independent transcripts survive serialization and closing to history", () => {
+  const a = { ...fresh(), transcript: [{ kind: "user" as const, text: "Only in first" }] };
+  const b = { ...fresh("second"), transcript: [{ kind: "agent" as const, text: "Only in second" }] };
+  const state = readChatTabs(JSON.stringify({ columns: [a, b], selected: {} }));
+  assert.deepEqual(state.columns[0].transcript, a.transcript);
+  assert.deepEqual(state.columns[1].transcript, b.transcript);
+  assert.equal(closeChatTab(state, a.id, "new").columns[0].id, b.id);
+});
+
+
+test("invalid durable state fails visibly instead of becoming an empty replacement", () => {
+  assert.throws(() => readDurableChatTabs({ columns: [{ id: 9 }], selected: {} }), /preserved/);
+  assert.throws(() => readDurableChatTabs({ columns: [{ ...fresh(), transcript: [{ kind: "agent", text: 7 }] }] }), /preserved/);
+  const saved = { columns: [fresh()], selected: {}, history: [{ ...fresh("closed"), legacyPath: "/old/project", legacySession: "saved" }] };
+  assert.equal(readDurableChatTabs(saved).history[0].legacySession, "saved");
 });

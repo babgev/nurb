@@ -8,6 +8,24 @@ export function restoreDraftFiles(failed: string[], draft: string[]): string[] {
   return [...new Set([...failed, ...draft])];
 }
 
+export type Draft = { text: string; files: string[] };
+
+// A column remounts when its agent changes and is dropped when a loose part is
+// left, and the composer's text lives in the DOM. Unsent work waits here,
+// keyed by chatKey, until that part's column mounts again.
+const stashed = new Map<string, Draft>();
+
+export function stashDraft(key: string, draft: Draft): void {
+  if (draft.text.trim() || draft.files.length) stashed.set(key, draft);
+  else stashed.delete(key);
+}
+
+export function unstashDraft(key: string): Draft {
+  const draft = stashed.get(key) ?? { text: "", files: [] };
+  stashed.delete(key);
+  return draft;
+}
+
 export class AttachmentDraft {
   private files: string[] = [];
   private pending: Promise<string[]>[] = [];
@@ -16,6 +34,10 @@ export class AttachmentDraft {
   constructor(onChange: (files: string[]) => void, files: string[] = []) {
     this.onChange = onChange;
     this.files = [...files];
+  }
+
+  get current(): string[] {
+    return this.files;
   }
 
   get hasContent(): boolean {

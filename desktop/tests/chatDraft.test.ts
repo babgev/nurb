@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   AttachmentDraft,
+  stashDraft,
+  unstashDraft,
   restoreDraftFiles,
   restoreDraftText,
 } from "../src/chatDraft.ts";
@@ -79,4 +81,12 @@ test("opening another provider tab copies pending attachments without consuming 
   assert.deepEqual(await copied, ["model.stl", "reference.png"]);
   assert.equal(draft.hasContent, true);
   assert.deepEqual(await draft.take(), ["model.stl", "reference.png"]);
+});
+
+
+test("a stashed tab draft returns once without leaking to a sibling", () => {
+  stashDraft("first", { text: "Pending", files: ["reference.png"] });
+  assert.deepEqual(unstashDraft("second"), { text: "", files: [] });
+  assert.deepEqual(unstashDraft("first"), { text: "Pending", files: ["reference.png"] });
+  assert.deepEqual(unstashDraft("first"), { text: "", files: [] });
 });

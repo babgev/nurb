@@ -1,5 +1,6 @@
 import {
   ClipboardEvent,
+  DragEvent,
   FormEvent,
   KeyboardEvent,
   type ReactNode,
@@ -12,44 +13,46 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
-import { IconMessagePlus, IconPaperclip } from "./Icons";
-import Markdown from "./Markdown";
-import { playChime, shouldPlayCompletionChime } from "./chime";
-import { AttachmentDraft, restoreDraftText } from "./chatDraft";
-import { activityStatus, elapsedLabel, mergeTool, type ToolItem } from "./chatActivity";
-import "./ChatActivity.css";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import clsx from "clsx";
+import {
+  ApprovalCard,
+  AssistantMarkdown,
+  useContextMenu,
+  Button,
+  ChatPanel,
+  changedSize,
+  CyclingPlaceholder,
+  DropHint,
+  Icon,
+  IconButton,
+  MeasurementCard,
+  NewItemsPill,
+  SpecCard,
+  cue,
+  type Message,
+} from "@nurb/ui";
+import { addMessage } from "@nurb/workbench/api";
+import {
+  applyChatEvent,
+  claudeNote,
+  describe,
+  type ChatEvent,
+  type Item,
+  type PermissionOption,
+  withNote,
+} from "./chatItems";
+import { AttachmentDraft, restoreDraftText, stashDraft, unstashDraft } from "./chatDraft";
 import ModelPicker, { type ConfigRow } from "./ModelPicker";
 import McpPanel from "./McpPanel";
+import { activityStatus, elapsedLabel } from "./chatActivity";
 
 // The whole-project conversation rides the per-part plumbing under a name no part
 // file can have. Twins live in App.tsx's mount and acp.rs's context line.
 export const PROJECT_CHAT = "//project";
-
-// Mirrors ChatEvent in src-tauri/src/acp.rs.
-type ChatEvent =
-  | { type: "activity"; phase: string }
-  | { type: "user_text"; text: string }
-  | { type: "agent_text"; text: string }
-  | { type: "agent_thought"; text: string }
-  | { type: "session_info"; title: string | null }
-  | { type: "note"; text: string }
-  | { type: "tool_call"; id: string; title: string; kind?: string; status: string; input?: string; output?: string }
-  | { type: "tool_call_update"; id: string; title?: string; kind?: string; status?: string; input?: string; output?: string }
-  | { type: "plan"; entries: PlanEntry[] }
-  | { type: "permission_request"; id: number; title: string; options: PermissionOption[] }
-  | { type: "permission_resolved"; id: number }
-  | { type: "session_error"; message: string };
-
-type PlanEntry = { content: string; status: string };
-type PermissionOption = { optionId: string; name: string; kind: string };
-
-type Item =
-  | { kind: "user"; text: string; files?: string[]; localId?: number }
-  | { kind: "agent"; text: string }
-  | { kind: "thought"; text: string }
-  | ToolItem
-  | { kind: "plan"; entries: PlanEntry[] }
-  | { kind: "note"; text: string };
+// A part being started inside a folder has no name yet. Its turns are stored
+// unnamed and handed to the part once the agent writes it. Twin in acp.rs.
+export const NEW_PART = "//new";
 
 type Permission = { id: number; title: string; options: PermissionOption[] };
 
@@ -62,92 +65,178 @@ export const AGENT_LABEL: Record<string, string> = {
   grok: "Grok",
 };
 
-const TOOL_STATUS_LABEL: Record<string, string> = {
-  pending: "waiting",
-  in_progress: "working…",
-  completed: "done",
-  failed: "failed",
-  interrupted: "stopped",
-};
-
-// Tool titles arrive as developer-speak ("Edit parts/lid.py", "nurb check").
-// The app's audience is hobbyists, so cards and permission dialogs translate
-// what they can into plain activity language and fall back to the raw title,
-// which stays untouched in state and in the debug event log.
-const FILE_TITLE = /^(Read|Edit|Write)\s+(?:.*\/)?parts\/([A-Za-z0-9_]+)\.py$/;
-const NURB_TITLE = /^(?:uv run\s+)?nurb\s+([a-z]+)/;
-const FILE_VERBS: Record<string, [string, string]> = {
-  Read: ["looking at", "look at"],
-  Edit: ["editing", "edit"],
-  Write: ["creating", "create"],
-};
-const NURB_VERBS: Record<string, [string, string]> = {
-  build: ["building the part", "build the part"],
-  check: ["checking printability", "check printability"],
-  inspect: ["inspecting the part", "inspect the part"],
-  verify: ["double-checking the part", "double-check the part"],
-  compare: ["measuring against the original", "measure against the original"],
-  render: ["rendering a preview", "render a preview"],
-  export: ["exporting print files", "export print files"],
-  rules: ["reading the design rules", "read the design rules"],
-  api: ["checking the toolbox", "check the toolbox"],
-  card: ["updating the part's notes", "update the part's notes"],
-};
-const KIND_VERBS: Record<string, [string, string]> = {
-  read: ["reading project files", "read project files"],
-  edit: ["editing project files", "edit project files"],
-  delete: ["removing project files", "remove project files"],
-  search: ["searching the project", "search the project"],
-  execute: ["running a command", "run a command"],
-  fetch: ["looking something up", "look something up"],
-  think: ["thinking", "think"],
-};
-
 const basename = (path: string) => path.split("/").pop() ?? path;
 
-// mode 0 is the activity form for cards ("editing lid"); mode 1 the plain verb
-// form for permission dialogs ("edit lid").
-function describe(title: string, kind: string | undefined, mode: 0 | 1): string {
-  const file = title.match(FILE_TITLE);
-  if (file) return `${FILE_VERBS[file[1]][mode]} ${file[2]}`;
-  const nurb = title.match(NURB_TITLE);
-  if (nurb && NURB_VERBS[nurb[1]]) return NURB_VERBS[nurb[1]][mode];
-  if (kind && KIND_VERBS[kind]) return KIND_VERBS[kind][mode];
-  return title;
+// A plan entry reads by its state alone, so the three states stay separable
+// without a legend.
+const PLAN_TONE: Record<string, string> = {
+  completed: "text-faint line-through",
+  in_progress: "text-ink",
+  pending: "text-muted",
+};
+
+// The ACP kind decides the weight: standing permission is the loud one, this
+// once is the quiet allow, and everything else (the refusals) is plain text.
+function permissionVariant(kind: string): "accent" | "outline" | "ghost" {
+  if (kind === "allow_always") return "accent";
+  if (kind === "allow_once") return "outline";
+  return "ghost";
+}
+
+/** Word for word what the Claude driver says when a resume finds no transcript. */
+const RESTORE_FAILED = "Couldn't restore this conversation, so this is a fresh one.";
+
+// The first conversation on this Mac gets examples instead of an instruction: the
+// hard part of a first part is believing it can be asked for in plain words.
+const PRIMED_KEY = "nurb-composer-primed";
+const FIRST_RUN_PLACEHOLDERS = [
+  "a bracket for the 25 mm rail above my bench",
+  "a knob to replace the one I snapped off",
+  "a bin that fits the drawer, not the other way round",
+];
+
+// A locked-down webview throws on plain access, so an unreadable store counts as
+// primed: an example reel is a nicety, and showing it forever is worse than never.
+function readPrimed(): boolean {
+  try {
+    return localStorage.getItem(PRIMED_KEY) !== null;
+  } catch {
+    return true;
+  }
+}
+
+// How far up the transcript counts as reading rather than following.
+const PINNED_SLACK_PX = 24;
+// The viewer resnaps its grid on this, so a held key cannot make it stutter.
+const GRIDFINITY_GAP_MS = 10_000;
+
+const CLAUDE_SIGN_IN =
+  "Sign in to Claude Code first: open a terminal, run claude, and follow the prompts. Then come back here.";
+
+/** A turn: who spoke and its number over the prose itself. */
+// A right-click on a turn copies the whole of it, which a drag across a long
+// reply with tables and lists in it does badly.
+function Turn({ who, n, text, children }: { who: string; n?: string; text?: string; children: ReactNode }) {
+  const context = useContextMenu();
+  return (
+    <div
+      className="flex flex-col gap-1.5"
+      onContextMenu={(e) => {
+        // A selection gets the webview's own Copy, which copies just that.
+        if (window.getSelection()?.toString()) return;
+        context.open(e, text ? [{ label: "Copy message", onSelect: () => void writeText(text) }] : undefined);
+      }}
+    >
+      {context.menu}
+      <div className="flex items-baseline justify-between">
+        <span className="mono-label text-muted">{who}</span>
+        {n ? <span className="mono-caption text-faint [letter-spacing:0.1em]">{n}</span> : null}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+/** One row of the project's own transcript. */
+// A stored row that is a step of the work rather than something said: a tool call, or
+// the build a save ran. The person is not a developer; the part on the stage is the
+// result, and the working line says what is happening while it happens.
+function isWork(message: Message): boolean {
+  const payload = message.payload;
+  if (payload?.type === "step" || payload?.type === "build") return true;
+  // A size first written down is already in the plan's table; only a change is news.
+  return payload?.type === "measurement" && !changedSize(payload.measurement);
+}
+
+function FileNames({ names }: { names: string[] }) {
+  return (
+    <span className="mt-1.5 flex flex-wrap gap-1">
+      {names.map((name, i) => (
+        <span key={i} className="mono-id rounded-[3px] bg-raised px-1.5 py-0.5 text-muted">
+          {name}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+function Stored({ message, who, n }: { message: Message; who: string; n?: string }) {
+  const payload = message.payload;
+  return (
+    <div className="flex flex-col gap-4">
+      {message.content || message.files?.length ? (
+        <Turn who={message.role === "user" ? "You" : who} n={n} text={message.content ?? undefined}>
+          {message.role === "user" ? (
+            <>
+              {message.content && (
+                <p className="text-chat whitespace-pre-wrap text-ink-soft">{message.content}</p>
+              )}
+              {message.files?.length ? <FileNames names={message.files} /> : null}
+            </>
+          ) : (
+            <div className="text-chat text-ink-soft">
+              <AssistantMarkdown content={message.content ?? ""} />
+            </div>
+          )}
+        </Turn>
+      ) : null}
+      {payload?.type === "spec" && (
+        <SpecCard spec={payload.spec} model={payload.model} effort={payload.effort} />
+      )}
+      {payload?.type === "measurement" && <MeasurementCard measurement={payload.measurement} />}
+    </div>
+  );
 }
 
 function Chat({
+  tabId, tabBar, draft, initialConfig, initialItems, onDraft, onConfig, onModel, onItems,
   path,
   part,
+  subject,
+  wholeProject,
+  messages,
   agent,
   agents,
   resume,
-  draft,
   hidden,
   seed,
   onSeed,
   onSession,
-  onFresh,
   onAgent,
   onBusy,
   onSignIn,
-  tabBar,
-  onModel,
-  onDraft,
-  onConfig,
-  initialConfig,
 }: {
+  tabId: string;
+  tabBar?: ReactNode;
+  draft?: { text: string; files: string[] };
+  initialConfig?: Record<string, string>;
+  initialItems?: Item[];
+  onDraft?: (draft: { text: string; files: string[] }) => void;
+  onConfig?: (values: Record<string, string>) => void;
+  onModel?: (model: string) => void;
+  onItems?: (items: Item[]) => void;
   path: string;
+  // The project's own transcript, which outlives any one conversation. Hidden
+  // columns are handed an empty list, since only the selected project loads one.
+  messages: Message[];
   // The column's identity: this is the part's conversation, whatever the
   // viewer shows by the time a reply lands.
   part: string;
+  // What the copy calls this conversation: the part, or the folder when the
+  // conversation is about every part in it.
+  subject?: string | null;
+  // True only for a folder's own conversation. A project holding one part has a
+  // single conversation, and it is that part's.
+  wholeProject?: boolean;
   // Fixed for the life of the conversation: a resumed session keeps the agent
   // that ran it, a fresh one takes the default from the agents pane.
   agent: string;
-  // Installed providers offered together in the model picker.
+  // Everything the app can host, for the header's switcher.
   agents: { id: string; label: string; loggedIn: boolean | null }[];
+  // Every row the project has stored, this part's or not, so a live step can find its
+  // row even when it was a project-wide call that this part's transcript leaves out.
+  landed?: Message[];
   resume: string | null;
-  draft?: { text: string; files: string[] };
   hidden: boolean;
   // Text waiting for the composer, from a viewer nudge. Prefilled when the column
   // is visible, never sent; onSeed reports it landed so the owner clears it.
@@ -161,33 +250,29 @@ function Chat({
   onAgent: (id: string, unstarted: boolean, draft: { text: string; files: string[] }, model: string) => Promise<boolean>;
   onBusy: (busy: boolean) => void;
   onSignIn: (agent: string) => Promise<boolean>;
-  tabBar?: ReactNode;
-  onModel?: (label: string) => void;
-  onDraft?: (draft: { text: string; files: string[] }) => void;
-  onConfig?: (values: Record<string, string>) => void;
-  initialConfig?: Record<string, string>;
 }) {
   const label = AGENT_LABEL[agent] ?? agent;
   // Known signed out, not merely unknown: an unknown status stays quiet.
   const signedOut = agents.find((option) => option.id === agent)?.loggedIn === false;
-  // The sentinel never reaches copy: everywhere the column says its name, the
-  // project conversation speaks of the project.
+  // The sentinel never reaches copy: everywhere the column says its name, it
+  // says the name the owner gave it.
   const isProject = part === PROJECT_CHAT;
-  const [items, setItems] = useState<Item[]>([]);
+  const isNew = part === NEW_PART;
+  // The transcript names a part only once it exists.
+  const stamp = isProject || isNew ? null : part;
+  // A rename can land mid-turn, and the session's event handler outlives the render
+  // that made it, so a reply reads the name at the moment it arrives.
+  const stampRef = useRef(stamp);
+  stampRef.current = stamp;
+  const aboutProject = wholeProject ?? isProject;
+  const spoken = subject ?? (isProject ? "this project" : part);
+  // Claude runs through the app's own driver, which stores the conversation in
+  // the project rather than replaying one of its own.
+  const isClaude = agent === "claude";
+  // The folder's last segment is the project's id in the store.
+  const projectId = path.split("/").filter(Boolean).pop() ?? "";
+  const [items, setItems] = useState<Item[]>(initialItems ?? []);
   const [busy, setBusy] = useState(false);
-  const [phase, setPhase] = useState("");
-  const [clock, setClock] = useState(Date.now());
-  const [lastEventAt, setLastEventAt] = useState(Date.now());
-  const [turnStartedAt, setTurnStartedAt] = useState(Date.now());
-  const [cancelledAt, setCancelledAt] = useState<number | null>(null);
-  const cancelRef = useRef(false);
-  const choicesRef = useRef<Record<string, string>>({ ...initialConfig });
-  const onDraftRef = useRef(onDraft);
-  onDraftRef.current = onDraft;
-  const onModelRef = useRef(onModel);
-  onModelRef.current = onModel;
-  const onConfigRef = useRef(onConfig);
-  onConfigRef.current = onConfig;
   // A resumed transcript starts loading after the first paint, so treat it as
   // starting immediately rather than briefly exposing a live composer.
   const [starting, setStarting] = useState(Boolean(resume));
@@ -197,26 +282,78 @@ function Chat({
   const [permissions, setPermissions] = useState<Permission[]>([]);
   // Absolute paths; the Rust side reads them at send time.
   const [attachments, setAttachments] = useState<string[]>(draft?.files ?? []);
+  const refusalRef = useRef<string | null>(null);
+  // Stop can land before the prompt has gone out, while the files are checked or
+  // the session starts. There is nothing to interrupt yet, so the send stands down.
+  const stoppedRef = useRef(false);
+  const promptingRef = useRef(false);
   const attachmentDraftRef = useRef<AttachmentDraft | null>(null);
   if (!attachmentDraftRef.current) {
-    attachmentDraftRef.current = new AttachmentDraft(setAttachments, draft?.files);
+    attachmentDraftRef.current = new AttachmentDraft(setAttachments, draft?.files ?? []);
   }
   const attachmentDraft = attachmentDraftRef.current;
   const [dropping, setDropping] = useState(false);
+  // One drag over the composer fires enter and leave for every child it crosses,
+  // so the hint follows a depth count rather than the last event seen.
+  const dragDepth = useRef(0);
+  // The transcript follows the reply only while the reader is at the end of it.
+  // Scrolling up is deliberate, so a reply that lands then offers a pill.
+  const pinnedRef = useRef(true);
+  const [newReply, setNewReply] = useState(false);
+  const [primed, setPrimed] = useState(readPrimed);
+  const [empty, setEmpty] = useState(true);
+  const gridfinityAt = useRef(0);
+  // The project's transcript in the order it was written, then whatever this
+  // turn has produced that has not reached the store yet.
+  // CAD specs and measurement changes belong to the shared part. Spoken turns
+  // stay in their own tab, even when another agent edits that same part.
+  const ordered = messages.filter((message) => message.payload?.type === "spec" || message.payload?.type === "measurement").sort((a, b) => (a.sequence_number ?? 0) - (b.sequence_number ?? 0));
+  const said = messages.length > 0 || items.length > 0;
+  // The newest stored row, read at event time so a step remembers where the
+  // transcript stood when it was called.
+  const seqRef = useRef(0);
+  seqRef.current = messages.reduce((top, m) => Math.max(top, m.sequence_number ?? 0), 0);
   // The model and effort this conversation runs on. Empty before the agent has
   // ever reported its lists, which is only ever the first chat on this Mac.
   const [config, setConfig] = useState<ConfigRow[]>([]);
-  const [configError, setConfigError] = useState<string | null>(null);
-  const [configuring, setConfiguring] = useState(false);
-  const configuringRef = useRef(false);
+  const choicesRef = useRef<Record<string, string>>({ ...initialConfig });
   const [providerConfigs, setProviderConfigs] = useState<Record<string, ConfigRow[]>>({});
   const [providerLoading, setProviderLoading] = useState<Record<string, boolean>>({});
   const [providerErrors, setProviderErrors] = useState<Record<string, string | null>>({});
+  const [configuring, setConfiguring] = useState(false);
+  const [configError, setConfigError] = useState<string | null>(null);
+  const configuringRef = useRef(false);
+  const configRequestsRef = useRef<Record<string, number>>({});
   const discoveryRef = useRef(new Set<string>());
   const discoveryStartedRef = useRef(false);
-  const configRequestsRef = useRef<Record<string, number>>({});
   const providerIds = agents.map((option) => option.id).join(",");
+  const startupIdRef = useRef<string | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+  const [lastEventAt, setLastEventAt] = useState(Date.now());
+  const [turnStartedAt, setTurnStartedAt] = useState(Date.now());
+  const [clock, setClock] = useState(Date.now());
+  const [phase, setPhase] = useState("");
+  const callbacks = useRef({ onDraft, onConfig, onModel, onItems });
+  callbacks.current = { onDraft, onConfig, onModel, onItems };
+  useEffect(() => { callbacks.current.onItems?.(items); }, [items]);
+  useEffect(() => {
+    callbacks.current.onDraft?.({ text: inputRef.current?.value ?? draft?.text ?? "", files: attachments });
+  }, [attachments]);
+  useEffect(() => {
+    if (!config.length) return;
+    callbacks.current.onConfig?.(Object.fromEntries(config.map((row) => [row.category, row.value])));
+    const model = config.find((row) => row.category === "model");
+    if (model) callbacks.current.onModel?.(model.options.find((option) => option.value === model.value)?.name ?? model.value);
+  }, [config]);
+  useEffect(() => {
+    if (!busy && !starting) return;
+    const timer = setInterval(() => setClock(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [busy, starting]);
   const sessionRef = useRef<string | null>(null);
+  // The part named in a Claude session's system prompt, which cannot change once
+  // the process is up. Older than `part` after a rename.
+  const promptedPartRef = useRef(part);
   // A resume id is single-use after the adapter accepts it. Authentication
   // failures retain it; a dead resumed session must not replay it again.
   const resumeRef = useRef<string | null>(resume);
@@ -229,33 +366,24 @@ function Chat({
   // In-flight start, shared across StrictMode's double mount so a resume on
   // mount cannot spawn two adapters.
   const startRef = useRef<Promise<string> | null>(null);
-  const startupIdRef = useRef<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // The composer grows with its text, two lines at rest and twelve at most,
+  // then scrolls. Called after every programmatic write too, because only
+  // typing fires onInput.
+  const grow = () => {
+    const box = inputRef.current;
+    if (!box) return;
+    box.style.height = "auto";
+    box.style.height = `${box.scrollHeight}px`;
+    setEmpty(box.value.trim().length === 0);
+    callbacks.current.onDraft?.({ text: box.value, files: attachmentDraft.current });
+  };
   // Latest callbacks behind stable refs so ensureSession never goes stale.
   const onSessionRef = useRef(onSession);
   onSessionRef.current = onSession;
   const onBusyRef = useRef(onBusy);
   onBusyRef.current = onBusy;
-
-  useEffect(() => {
-    if (!busy && !starting) return;
-    const timer = window.setInterval(() => setClock(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [busy, starting]);
-
-  useEffect(() => {
-    onDraftRef.current?.({ text: inputRef.current?.value ?? "", files: attachments });
-  }, [attachments]);
-
-  useEffect(() => {
-    const row = config.find((row) => row.category === "model");
-    const name = row?.options.find((option) => option.value === row.value)?.name;
-    if (name) onModelRef.current?.(name);
-    if (config.length) onConfigRef.current?.(Object.fromEntries(config.map((row) => [row.category, row.value])));
-  }, [config]);
-
-  const publishDraft = () => onDraftRef.current?.({ text: inputRef.current?.value ?? "", files: attachments });
 
   useEffect(() => {
     // A removed column cannot leave a stale rail dot behind. Turn transitions
@@ -269,30 +397,86 @@ function Chat({
     closedRef.current = false;
     return () => {
       closedRef.current = true;
-      const startup = startupIdRef.current;
-      if (startup) invoke("cancel_chat_start", { startupId: startup }).catch(() => {});
       const session = sessionRef.current;
+      if (startupIdRef.current) invoke("cancel_chat_start", { startupId: startupIdRef.current }).catch(() => {});
       sessionRef.current = null;
       if (session) invoke("close_chat", { sessionId: session }).catch(() => {});
     };
   }, []);
 
   useEffect(() => {
-    const pane = scrollRef.current;
+    // The scroller is ChatPanel's own column; the ref rides the transcript it
+    // wraps, since the panel shell keeps that element to itself.
+    const pane = scrollRef.current?.parentElement;
+    if (!pane) return;
+    const onScroll = () => {
+      const atEnd = pane.scrollHeight - pane.scrollTop - pane.clientHeight <= PINNED_SLACK_PX;
+      if (atEnd === pinnedRef.current) return;
+      pinnedRef.current = atEnd;
+      if (atEnd) setNewReply(false);
+    };
+    onScroll();
+    pane.addEventListener("scroll", onScroll, { passive: true });
+    return () => pane.removeEventListener("scroll", onScroll);
+  }, []);
+
+  useEffect(() => {
+    // Follow the end of the transcript, and only from the end of it.
+    const pane = scrollRef.current?.parentElement;
+    if (pane && pinnedRef.current) pane.scrollTop = pane.scrollHeight;
+  }, [messages, items, permissions, busy]);
+
+  // Everything the agent has put on screen, counted so a reply that is still
+  // streaming moves the number. The user's own lines are not news to the user.
+  const replyMark =
+    messages.filter((m) => m.role !== "user").length +
+    items.reduce(
+      (n, item) => n + (item.kind === "agent" ? item.text.length : item.kind === "user" ? 0 : 1),
+      0,
+    );
+  useEffect(() => {
+    if (!pinnedRef.current) setNewReply(true);
+  }, [replyMark]);
+
+  const jumpToLatest = () => {
+    const pane = scrollRef.current?.parentElement;
+    pinnedRef.current = true;
+    setNewReply(false);
+    // Instant, not smooth: every intermediate frame of a smooth scroll is a
+    // scroll event away from the end, which unpins and re-arms the pill mid-jump.
     if (pane) pane.scrollTop = pane.scrollHeight;
-  }, [items, permissions, busy]);
+  };
+
+  // New conversation clears the composer; every other remount keeps it.
+  const discardRef = useRef(false);
+  const keyRef = useRef(tabId);
+  keyRef.current = tabId;
+  useEffect(() => {
+    const box = inputRef.current;
+    const restored = draft ?? unstashDraft(keyRef.current);
+    if (box && restored.text) {
+      box.value = restoreDraftText(restored.text, box.value);
+      grow();
+    }
+    attachmentDraft.restore(restored.files);
+    return () => {
+      if (discardRef.current) return;
+      stashDraft(keyRef.current, { text: box?.value ?? "", files: attachmentDraft.current });
+    };
+  }, [attachmentDraft]);
 
   useEffect(() => {
     // Dev-only test hook: the Rust side forwards loopback-socket text here so
     // UI automation can fill the composer without stealing keyboard focus.
-    if (!import.meta.env.DEV) return;
+    if (!import.meta.env.DEV || hidden) return;
     const unlisten = listen<string>("test-type", (event) => {
       if (inputRef.current) inputRef.current.value = event.payload;
+      grow();
     });
     return () => {
-      unlisten.then((stop) => stop());
+      unlisten.then((stop) => stop()).catch(() => {});
     };
-  }, []);
+  }, [hidden]);
 
   useEffect(() => {
     // Same hook, submit half: every mounted column hears the event, so only
@@ -302,7 +486,7 @@ function Chat({
       inputRef.current?.form?.requestSubmit();
     });
     return () => {
-      unlisten.then((stop) => stop());
+      unlisten.then((stop) => stop()).catch(() => {});
     };
   }, [hidden]);
 
@@ -317,6 +501,7 @@ function Chat({
       if (box.value !== seed && !box.value.endsWith(`\n${seed}`)) {
         box.value = box.value.trim() ? `${box.value}\n${seed}` : seed;
       }
+      grow();
       box.focus();
     }
     onSeed?.();
@@ -328,7 +513,6 @@ function Chat({
     // or one drop would attach to every conversation.
     if (hidden) return;
     const unlisten = getCurrentWebview().onDragDropEvent((event) => {
-      if (configuringRef.current) { setDropping(false); return; }
       if (event.payload.type === "enter") setDropping(true);
       if (event.payload.type === "leave") setDropping(false);
       if (event.payload.type === "drop") {
@@ -338,96 +522,58 @@ function Chat({
       }
     });
     return () => {
-      unlisten.then((stop) => stop());
+      unlisten.then((stop) => stop()).catch(() => {});
     };
   }, [hidden, attachmentDraft]);
 
-  const applyEvent = useCallback((event: ChatEvent) => {
-    const now = Date.now();
-    setLastEventAt(now);
-    setClock(now);
-    switch (event.type) {
-      case "activity":
-        setPhase(event.phase);
-        break;
-      case "user_text":
-        // Only replayed history carries user chunks; live turns render the
-        // composer text directly in send().
-        setItems((list) => {
-          const last = list[list.length - 1];
-          if (last && last.kind === "user") {
-            return [...list.slice(0, -1), { ...last, text: last.text + event.text }];
+  const applyEvent = useCallback(
+    (event: ChatEvent) => {
+      setLastEventAt(Date.now());
+      if (restoringRef.current && initialItems?.length && !["session_error", "activity"].includes(event.type)) return;
+      if (event.type === "activity") { setPhase(event.phase); return; }
+      setPhase(event.type === "agent_thought" ? "Receiving provider thinking" : event.type === "agent_text" ? "Receiving response" : `Waiting for ${label}'s next update`);
+      switch (event.type) {
+        case "session_info":
+          // Titles have no home since the visible session list went away.
+          return;
+        case "permission_request":
+          setPermissions((list) => [
+            ...list,
+            { id: event.id, title: event.title, options: event.options },
+          ]);
+          return;
+        case "permission_resolved":
+          setPermissions((list) => list.filter((p) => p.id !== event.id));
+          return;
+        case "prose":
+          // Store prose in the CAD history while retaining this tab's own copy.
+          // Another conversation's prose never enters this tab's transcript.
+          if (isClaude) {
+            // Drop the streaming copy only once the row exists, or the text
+            // blinks out for the refetch's round trip.
+            addMessage(projectId, "assistant", event.text, stampRef.current)
+              .catch((e) => setItems((list) => [...list, { kind: "note", text: String(e) }]));
+            return;
           }
-          return [...list, { kind: "user", text: event.text }];
-        });
-        break;
-      case "session_info":
-        // Titles have no home since the visible session list went away.
-        break;
-      case "note":
-        setItems((list) => [...list, { kind: "note", text: event.text }]);
-        break;
-      case "agent_text":
-      case "agent_thought": {
-        setPhase(event.type === "agent_text" ? "Receiving response" : "Receiving provider thinking update");
-        const kind = event.type === "agent_text" ? "agent" : "thought";
-        setItems((list) => {
-          const last = list[list.length - 1];
-          if (last && last.kind === kind) {
-            return [...list.slice(0, -1), { ...last, text: last.text + event.text }];
+          break;
+        case "session_error": {
+          // The dead session is gone from the Rust map too; forgetting it here
+          // is what lets the next send start the fresh chat the note promises.
+          // The driver's session lives on disk, so the next start resumes it.
+          if (isClaude && sessionRef.current) resumeRef.current = sessionRef.current;
+          sessionRef.current = null;
+          const trouble = isClaude ? claudeNote(event.message) : null;
+          if (trouble) {
+            setItems((list) => withNote(list, trouble));
+            return;
           }
-          return [...list, { kind, text: event.text } as Item];
-        });
-        break;
+          break;
+        }
       }
-      case "tool_call":
-      case "tool_call_update":
-        setPhase(`Waiting for ${label}'s next update`);
-        setItems((list) => {
-          const index = list.findIndex((item) => item.kind === "tool" && item.id === event.id);
-          const previous = index < 0 ? undefined : list[index] as ToolItem;
-          const tool = mergeTool(previous, event, now, restoringRef.current);
-          if (index < 0) return [...list, tool];
-          return list.map((item, at) => at === index ? tool : item);
-        });
-        break;
-      case "plan":
-        setItems((list) => {
-          let index = -1;
-          for (let i = list.length - 1; i >= 0; i--) {
-            if (list[i].kind === "plan") {
-              index = i;
-              break;
-            }
-          }
-          if (index >= 0) {
-            const next = [...list];
-            next[index] = { kind: "plan", entries: event.entries };
-            return next;
-          }
-          return [...list, { kind: "plan", entries: event.entries }];
-        });
-        break;
-      case "permission_request":
-        setPermissions((list) => [
-          ...list,
-          { id: event.id, title: event.title, options: event.options },
-        ]);
-        break;
-      case "permission_resolved":
-        setPermissions((list) => list.filter((p) => p.id !== event.id));
-        break;
-      case "session_error":
-        setBusy(false);
-        onBusyRef.current(false);
-        setPermissions([]);
-        // The dead session is gone from the Rust map too; forgetting it here
-        // is what lets the next send start the fresh chat the note promises.
-        sessionRef.current = null;
-        setItems((list) => [...list, { kind: "note", text: event.message }]);
-        break;
-    }
-  }, [label]);
+      setItems((list) => applyChatEvent(list, event, Date.now(), seqRef.current));
+    },
+    [isClaude, projectId, label],
+  );
 
   const readConfig = useCallback(async (id: string) => {
     const request = (configRequestsRef.current[id] ?? 0) + 1;
@@ -562,8 +708,8 @@ function Chat({
       const requestedResume = resumeRef.current;
       restoringRef.current = Boolean(requestedResume);
       setStarting(true);
-      setLastEventAt(Date.now());
       setTurnStartedAt(Date.now());
+      setLastEventAt(Date.now());
       setPhase(requestedResume ? "Restoring conversation" : `Connecting to ${label}`);
       try {
         const startupId = crypto.randomUUID();
@@ -573,9 +719,11 @@ function Chat({
         const session = await invoke<string>("start_chat", {
           path,
           agent,
+          part,
           onEvent,
           resume: requestedResume,
           startupId,
+          initialConfig: choicesRef.current,
         });
         if (closedRef.current) {
           // The user switched projects while the adapter was starting; without
@@ -583,45 +731,29 @@ function Chat({
           invoke("close_chat", { sessionId: session }).catch(() => {});
           throw new Error("chat closed");
         }
+        if (stoppedRef.current) {
+          await invoke("close_chat", { sessionId: session }).catch(() => {});
+          throw new Error("Stopped before sending. Your draft is preserved.");
+        }
         sessionRef.current = session;
+        promptedPartRef.current = part;
         resumeRef.current = null;
         restoringRef.current = false;
-        if (cancelRef.current) {
-          await invoke("close_chat", { sessionId: session });
-          sessionRef.current = null;
-          throw new Error("Stopped before sending. Send your message again when ready.");
-        }
-        // Each tab owns its selection even when another tab changed provider defaults.
-        try {
-          if (!requestedResume) {
-            for (const [category, value] of Object.entries(choicesRef.current).sort(([a], [b]) => Number(b === "model") - Number(a === "model"))) {
-              const rows = await invoke<ConfigRow[]>("set_chat_config", { agent, sessionId: session, category, value });
-              setConfig(rows);
-            }
-          }
-          if (cancelRef.current) throw new Error("Stopped before sending. Send your message again when ready.");
-        } catch (error) {
-          sessionRef.current = null;
-          await invoke("close_chat", { sessionId: session }).catch(() => {});
-          throw error;
-        }
         onSessionRef.current(session);
         // The live session is authoritative: it may have clamped a remembered
         // pick the account no longer offers.
         refreshConfig();
         return session;
-      } catch (error) {
-        if (cancelRef.current) throw new Error("Stopped before sending the message.");
-        throw error;
       } finally {
         startupIdRef.current = null;
         startRef.current = null;
         setStarting(false);
+        setCancelling(false);
       }
     })();
     startRef.current = start;
     return start;
-  }, [path, agent, label, applyEvent, refreshConfig]);
+  }, [path, part, agent, applyEvent, refreshConfig]);
 
   const restoreSession = useCallback(async () => {
     try {
@@ -629,84 +761,137 @@ function Chat({
     } catch (e) {
       const message = String(e);
       if (message === "Error: chat closed") return;
-      if (message.includes("auth_required")) {
+      const trouble = isClaude ? claudeNote(message) : null;
+      if (trouble) {
+        setItems((list) => withNote(list, trouble));
+      } else if (message.includes("auth_required")) {
         setAuthNeeded("resume");
       } else {
         setItems((list) => [...list, { kind: "note", text: message }]);
       }
     }
-  }, [ensureSession]);
+  }, [ensureSession, isClaude]);
 
   useEffect(() => {
     // A history session replays its transcript when it opens, not on the first send; reuse this path after sign-in.
-    if (resume && !hidden && !sessionRef.current) restoreSession();
-  }, [resume, hidden, restoreSession]);
+    if (resume) restoreSession();
+  }, [resume, restoreSession]);
 
   const send = useCallback(
     async (text: string, files: string[]) => {
       sendingRef.current = true;
-      const startedAt = Date.now();
-      cancelRef.current = false;
-      setCancelledAt(null);
-      setTurnStartedAt(startedAt);
-      setLastEventAt(startedAt);
-      setClock(startedAt);
-      setPhase(`Waiting for ${label}'s response`);
+      stoppedRef.current = false;
+      setCancelling(false);
+      setTurnStartedAt(Date.now());
+      setLastEventAt(Date.now());
+      setPhase(`Preparing ${label}`);
+      // A refused file was about the draft this send replaces, and a failed restore
+      // has been said. Live notes sit below Claude's stored turns, so left alone
+      // either would trail every later reply.
+      setItems((list) =>
+        list.filter(
+          (item) =>
+            item.kind !== "note" ||
+            (item.text !== refusalRef.current && !(isClaude && item.text === RESTORE_FAILED)),
+        ),
+      );
       const localId = nextLocalIdRef.current++;
-      setItems((list) => [
-        ...list,
-        {
-          kind: "user",
-          text,
-          files: files.length ? files.map(basename) : undefined,
-          localId,
-        },
-      ]);
+      // Each conversation owns its spoken turns, including native Claude.
+      // The project also keeps a shared audit trail for the CAD tools.
+      {
+        setItems((list) => [
+          ...list,
+          {
+            kind: "user",
+            text,
+            files: files.length ? files.map(basename) : undefined,
+            localId,
+          },
+        ]);
+      }
       setBusy(true);
       onBusyRef.current(true);
+      // The send is the only half of the turn that makes a sound. Stopping is
+      // the user changing their mind, which is not news to them.
+      cue("press");
       setAuthNeeded("none");
       let completed = false;
+      let stored = false;
+      let refused = false;
+      // Nothing was sent. Restore it ahead of any next draft composed during
+      // the turn, and keep both turns' attachments.
+      const restoreDraft = () => {
+        setItems((list) =>
+          list.filter((item) => item.kind !== "user" || item.localId !== localId),
+        );
+        if (inputRef.current) {
+          inputRef.current.value = restoreDraftText(text, inputRef.current.value);
+          grow();
+        }
+        attachmentDraft.restore(files);
+      };
       try {
+        if (files.length > 0) {
+          refused = true;
+          await invoke("check_attachments", { attachments: files, claude: isClaude });
+          refused = false;
+        }
         const session = await ensureSession();
-        if (cancelRef.current) throw new Error("Stopped before sending. Send your message again when ready.");
-        setPhase(`Waiting for ${label}'s response`);
-        const stopReason = await invoke<string>("send_prompt", {
+        if (stoppedRef.current) {
+          restoreDraft();
+          return;
+        }
+        if (isClaude) {
+          await addMessage(
+            projectId,
+            "user",
+            text,
+            stamp,
+            files.length ? files.map(basename) : undefined,
+          );
+          stored = true;
+        }
+        promptingRef.current = true;
+        const renamed = isClaude && promptedPartRef.current !== part;
+        promptedPartRef.current = part;
+        await invoke<string>("send_prompt", {
           sessionId: session,
-          text,
+          // For the agent only: the transcript already holds what the person typed.
+          text: renamed ? `${text}\n\n(This part is now called "${part}". Use that name from here on.)` : text,
           part: part ?? null,
           attachments: files,
         });
-        completed = stopReason !== "cancelled";
-        if (stopReason === "cancelled") setItems((list) => [...list, { kind: "note", text: "Turn stopped." }]);
+        completed = true;
       } catch (e) {
         const message = String(e);
-        if (message.includes("auth_required")) {
-          // Nothing was sent. Restore it ahead of any next draft composed
-          // during the turn, and keep both turns' attachments.
-          setItems((list) =>
-            list.filter((item) => item.kind !== "user" || item.localId !== localId),
-          );
-          if (inputRef.current) {
-            inputRef.current.value = restoreDraftText(text, inputRef.current.value);
-          }
-          attachmentDraft.restore(files);
-          setAuthNeeded("resend");
+        const trouble = isClaude ? claudeNote(message) : null;
+        // Before send_prompt starts, every failure is an unsent draft. Once a
+        // prompt is in flight, restoring it could accidentally send it twice.
+        if (!stored && !promptingRef.current) restoreDraft();
+        if (trouble || refused || message.includes("auth_required")) {
+          if (trouble) setItems((list) => withNote(list, trouble));
+          else if (refused) {
+            refusalRef.current = message;
+            setItems((list) => withNote(list, message));
+          } else setAuthNeeded("resend");
         } else {
-          setItems((list) => [...list, { kind: "note", text: message }]);
+          setItems((list) => withNote(list, message));
         }
       } finally {
+        promptingRef.current = false;
         sendingRef.current = false;
         setBusy(false);
         onBusyRef.current(false);
         setPermissions([]);
-        setItems((list) => list.map((item) => item.kind === "tool" && ["pending", "in_progress"].includes(item.status)
-          ? { ...item, status: "interrupted", finishedAt: Date.now() } : item));
-        // Only successful turns long enough to wander away from earn a chime;
-        // quick back-and-forth and failures should stay quiet.
-        if (shouldPlayCompletionChime(completed, Date.now() - startedAt)) playChime();
+        setCancelling(false);
+        // Every completed turn gets a cue, where the old chime waited 8s: the cue
+        // is short enough that a short reply can have one, and it marks the beat.
+        // Two of them: "ready" is for someone watching the part, "arrival"
+        // carries to another window, where the reply is news rather than a beat.
+        if (completed) cue(document.hasFocus() ? "ready" : "arrival");
       }
     },
-    [ensureSession, part, attachmentDraft, label],
+    [ensureSession, part, attachmentDraft, isClaude, projectId],
   );
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
@@ -719,7 +904,6 @@ function Chat({
     if (
       (!text && !attachmentDraft.hasContent) ||
       sendingRef.current ||
-      configuringRef.current ||
       starting ||
       startRef.current
     )
@@ -727,12 +911,22 @@ function Chat({
     // Reserve the turn before waiting: a second Enter must not queue another
     // send while a pasted image is still crossing the IPC boundary.
     sendingRef.current = true;
-    if (box) box.value = "";
-    publishDraft();
+    if (box) {
+      box.value = "";
+      grow();
+    }
     const files = await attachmentDraft.take();
     if (!text && files.length === 0) {
       sendingRef.current = false;
       return;
+    }
+    if (!primed) {
+      try {
+        localStorage.setItem(PRIMED_KEY, "1");
+      } catch {
+        // The examples stay for another session; nothing else depends on this.
+      }
+      setPrimed(true);
     }
     send(text, files);
   };
@@ -763,9 +957,44 @@ function Chat({
         ),
       ),
     );
-    attachmentDraft.track(saved).catch((e) =>
-      setItems((list) => [...list, { kind: "note", text: String(e) }]),
-    );
+    attachmentDraft
+      .track(saved)
+      .catch((e) => setItems((list) => [...list, { kind: "note", text: String(e) }]));
+  };
+
+  // The viewer listens for this and snaps its grid to the standard pitch. Once
+  // every ten seconds at most, because it fires on every keystroke of the word.
+  const nudgeGridfinity = (text: string) => {
+    if (!/gridfinity/i.test(text)) return;
+    const now = Date.now();
+    if (now - gridfinityAt.current < GRIDFINITY_GAP_MS) return;
+    gridfinityAt.current = now;
+    window.dispatchEvent(new CustomEvent("nurb:gridfinity"));
+  };
+
+  const typed = (event: FormEvent<HTMLTextAreaElement>) => {
+    grow();
+    nudgeGridfinity(event.currentTarget.value);
+    callbacks.current.onDraft?.({ text: event.currentTarget.value, files: attachments });
+  };
+
+  const dragEnter = (event: DragEvent<HTMLFormElement>) => {
+    if (!event.dataTransfer?.types.includes("Files")) return;
+    dragDepth.current += 1;
+    setDropping(true);
+  };
+
+  const dragLeave = () => {
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDropping(false);
+  };
+
+  const dragDrop = (event: DragEvent<HTMLFormElement>) => {
+    // Without this the WKWebView navigates to a URL dragged in from Mail or
+    // Notes, and there is no back button to come home with.
+    event.preventDefault();
+    dragDepth.current = 0;
+    setDropping(false);
   };
 
   const keydown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -776,30 +1005,19 @@ function Chat({
   };
 
   const cancel = async () => {
-    cancelRef.current = true;
-    setCancelledAt(Date.now());
+    stoppedRef.current = true;
+    setCancelling(true);
+    if (startupIdRef.current) await invoke("cancel_chat_start", { startupId: startupIdRef.current }).catch(() => {});
     const session = sessionRef.current;
-    if (!session && startupIdRef.current) {
-      await invoke("cancel_chat_start", { startupId: startupIdRef.current }).catch((error) =>
-        setItems((list) => [...list, { kind: "note", text: `Could not stop connection: ${String(error)}` }]),
-      );
-    }
-    if (session) {
-      try { await invoke("cancel_turn", { sessionId: session }); }
-      catch (error) { setItems((list) => [...list, { kind: "note", text: `Could not stop: ${String(error)}` }]); }
-    }
+    if (session && promptingRef.current) await invoke("cancel_turn", { sessionId: session }).catch((e) => setItems((list) => withNote(list, String(e))));
   };
-
   const disconnect = async () => {
+    stoppedRef.current = true;
     const session = sessionRef.current;
-    if (!session) return;
-    try {
-      await invoke("close_chat", { sessionId: session });
-      sessionRef.current = null;
-      setItems((list) => [...list, { kind: "note", text: "Disconnected the agent. Your files and conversation history are kept. Send a message to reconnect." }]);
-    } catch (error) {
-      setItems((list) => [...list, { kind: "note", text: `Could not disconnect: ${String(error)}` }]);
-    }
+    if (startupIdRef.current) await invoke("cancel_chat_start", { startupId: startupIdRef.current }).catch(() => {});
+    if (session) await invoke("close_chat", { sessionId: session });
+    sessionRef.current = null;
+    setBusy(false); setStarting(false); setCancelling(false); onBusyRef.current(false);
   };
 
   const signIn = async () => {
@@ -820,11 +1038,23 @@ function Chat({
     } catch (e) {
       setItems((list) => [...list, { kind: "note", text: String(e) }]);
       // Keep retry visible even though the failure adds an item to the transcript.
-      setAuthNeeded((state) => state === "none" ? "sign-in" : state);
+      setAuthNeeded((state) => (state === "none" ? "sign-in" : state));
     } finally {
       setSigningIn(false);
     }
   };
+
+  // The permission event carries no tool kind, so only pattern matches
+  // translate; anything else reads as "use: <title>". The Rust fallback title
+  // is already a full sentence.
+  const askedFor = (title: string) => {
+    if (title.startsWith(`${label} `)) return title;
+    const asked = describe(title, undefined, 1);
+    return asked === title ? `${label} wants to use: ${title}` : `${label} wants to ${asked}`;
+  };
+
+  // First run, an idle composer, nothing typed: the examples have the floor.
+  const priming = !primed && !busy && !starting && empty;
 
   const answerPermission = (permission: Permission, optionId: string) => {
     const session = sessionRef.current;
@@ -837,262 +1067,244 @@ function Chat({
     }).catch(() => {});
   };
 
-  const activity = activityStatus({ label, starting, restoring: restoringRef.current,
-    cancelling: cancelledAt !== null, permission: permissions.length > 0, phase,
-    lastEventAt, now: clock, tools: items.filter((item): item is ToolItem => item.kind === "tool"),
-  });
+  // Turn numbers run across the stored transcript and whatever this turn has
+  // produced that has not reached the store yet.
+  let counted = 0;
+  const nextTurn = () => String(++counted).padStart(2, "0");
+
+  // Shared CAD cards precede this conversation's own prose and expandable tool calls.
+  const flow: ({ kind: "stored"; message: Message } | { kind: "live"; item: Item; index: number })[] = [];
+  for (const message of ordered) if (message.content || !isWork(message)) flow.push({ kind: "stored", message });
+  items.forEach((item, index) => flow.push({ kind: "live", item, index }));
+
+  const work = activityStatus({ label, starting, restoring: restoringRef.current, cancelling, permission: permissions.length > 0, phase, lastEventAt, now: clock, tools: items.flatMap((item) => item.kind === "step" ? [{ kind: "tool" as const, id: item.step.id, title: item.tool ?? `${item.step.verb} ${item.step.object}`, status: item.step.status === "running" ? "in_progress" : item.step.status === "done" ? "completed" : item.step.status }] : []) });
 
   return (
-    <section className={hidden ? "chat chat-hidden" : "chat"}>
-      <div className="chat-header" data-tauri-drag-region>
-        {/* The part name is the only thing here allowed to truncate, so the
-            switcher lives beside it rather than inside it. */}
-        <span className="chat-header-left">
-          <span className="chat-header-label">{isProject ? "project" : part}</span>
-          <span aria-hidden="true">·</span>
-          <span>{label}</span>
-        </span>
-        {items.length > 0 && (
-          <button
-            className="chat-fresh"
-            title="open a new conversation tab sharing the same project files"
-            disabled={busy || starting || configuring}
-            onClick={onFresh}
-          >
-            <IconMessagePlus />
-            new tab
-          </button>
-        )}
-      </div>
-      {tabBar}
-      <div className="chat-transcript" ref={scrollRef}>
-        {items.length === 0 && !busy && (
-          <div className="chat-empty">
-            {isProject
-              ? `This conversation covers the whole project. Ask ${label} for new parts, or for changes every part should share.`
-              : `You're chatting with ${part}. Describe it or ask for changes, and ${label} will model it in the viewer.`}
+    <div className="fork-chat" hidden={hidden}>
+    {tabBar}
+    <ChatPanel
+      hidden={hidden}
+      dragRegion
+      strip={{ label: "Conversation" }}
+      composer={
+        <form
+          onSubmit={submit}
+          onDragEnter={dragEnter}
+          onDragOver={(event) => event.preventDefault()}
+          onDragLeave={dragLeave}
+          onDrop={dragDrop}
+          className={clsx(
+            "relative flex flex-col gap-2.5 rounded-[6px] border pt-2.5 pr-2.5 pb-2 pl-3 transition-colors",
+            dropping ? "border-accent bg-accent-wash" : "border-line bg-ground",
+          )}
+        >
+          <DropHint active={dropping} />
+          {attachments.length > 0 && (
+            <div className="flex flex-wrap gap-1">
+              {attachments.map((path) => (
+                <span
+                  key={path}
+                  className="mono-id inline-flex items-center gap-1 rounded-[3px] bg-raised px-1.5 py-0.5 text-muted"
+                >
+                  <span className="max-w-[140px] truncate">{basename(path)}</span>
+                  <button
+                    type="button"
+                    className="text-faint hover:text-ink"
+                    aria-label={`remove ${basename(path)}`}
+                    onClick={() => attachmentDraft.remove(path)}
+                  >
+                    <Icon name="xmark" className="size-2.5" />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+          <span className="relative block">
+            <textarea
+              ref={inputRef}
+              className="text-chat max-h-[216px] min-h-[36px] w-full resize-none overflow-y-auto bg-transparent text-ink placeholder:text-faint focus:outline-none disabled:text-muted"
+              placeholder={
+                priming
+                  ? ""
+                  : busy
+                    ? `${label} is working…`
+                    : starting
+                      ? restoringRef.current
+                        ? "Restoring conversation…"
+                        : `Starting ${label}…`
+                      : isNew
+                        ? "Describe the new part…"
+                        : `Describe or change ${spoken}…`
+              }
+              rows={2}
+              disabled={starting}
+              onInput={typed}
+              onKeyDown={keydown}
+              onPaste={paste}
+            />
+            <CyclingPlaceholder
+              lines={FIRST_RUN_PLACEHOLDERS}
+              active={priming}
+              className="text-chat text-faint"
+            />
+          </span>
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex min-w-0 items-center gap-0.5">
+              <IconButton
+                icon="plus"
+                label="attach photos or files"
+                className="size-6.5"
+                disabled={starting}
+                onClick={attach}
+              />
+              <ModelPicker agent={agent} providers={agents.map((provider) => ({ ...provider, config: provider.id === agent ? config : providerConfigs[provider.id] ?? [], loading: providerLoading[provider.id], error: providerErrors[provider.id] }))}
+                config={config} disabled={false} activeProviderBusy={busy || starting} configuring={configuring} error={configError} hasConversation={said}
+                onSelectModel={selectModel} onSelectConfig={pick} onRefresh={discoverModels} onSignIn={onSignIn}
+                onOpen={() => { if (!discoveryStartedRef.current) { discoveryStartedRef.current = true; void discoverModels(); } }} />
+              <McpPanel path={path} sessionId={sessionRef.current} hidden={hidden} />
+            </div>
+            {busy || starting ? (
+              <Button type="button" variant="accent" onClick={(event) => { event.preventDefault(); void cancel(); }}>
+                stop
+              </Button>
+            ) : (
+              <Button type="submit" variant="ink" trailingIcon="arrow-up" disabled={starting}>
+                send
+              </Button>
+            )}
           </div>
+        </form>
+      }
+    >
+      <div ref={scrollRef} className="flex flex-col gap-4 px-4 pt-3.5 pb-3">
+        {!said && !busy && (
+          <p className="text-chat text-muted">
+            {isNew
+              ? `Describe the new part for ${spoken}, and ${label} will model it here. It can use the sizes the other parts in ${spoken} share.`
+              : aboutProject
+              ? `This conversation covers every part in ${spoken}. Ask ${label} for a new part, or for a change they should all share.`
+              : `You're chatting with ${spoken}. Describe it or ask for changes, and ${label} will model it in the viewer.`}
+          </p>
         )}
         {/* Nothing said yet and the agent is known to be signed out: ask before the first message bounces. */}
-        {items.length === 0 && !starting && authNeeded === "none" && signedOut && (
-          <div className="chat-auth">
-            Sign in to {label} to start.{" "}
-            <button className="chat-auth-button" disabled={signingIn} onClick={signIn}>
-              {signingIn ? "signing in…" : "sign in"}
-            </button>
+        {!said && !starting && authNeeded === "none" && signedOut && (
+          <div className="flex flex-col items-start gap-2 rounded-[6px] bg-raised p-3">
+            <p className="text-chat text-muted">
+              {isClaude ? CLAUDE_SIGN_IN : `Sign in to ${label} to start.`}
+            </p>
+            {!isClaude && (
+              <Button variant="accent" disabled={signingIn} onClick={signIn}>
+                {signingIn ? "signing in…" : "sign in"}
+              </Button>
+            )}
           </div>
         )}
-        {items.map((item, index) => {
+        {flow.map((entry) => {
+          if (entry.kind === "stored") {
+            return (
+              <Stored
+                key={entry.message.id}
+                message={entry.message}
+                who={label}
+                n={entry.message.content || entry.message.files?.length ? nextTurn() : undefined}
+              />
+            );
+          }
+          const { item, index } = entry;
           switch (item.kind) {
             case "user":
               return (
-                <div key={index} className="chat-user">
-                  {item.text}
-                  {item.files && (
-                    <span className="chat-user-files">
-                      {item.files.map((name, i) => (
-                        <span key={i} className="chat-user-file">
-                          {name}
-                        </span>
-                      ))}
-                    </span>
-                  )}
-                </div>
+                <Turn key={index} who="You" n={nextTurn()} text={item.text}>
+                  <p className="text-chat whitespace-pre-wrap text-ink-soft">{item.text}</p>
+                  {item.files && <FileNames names={item.files} />}
+                </Turn>
               );
             case "agent":
               return (
-                <div key={index} className="chat-agent">
-                  <Markdown text={item.text} />
-                </div>
+                <Turn key={index} who={label} n={nextTurn()} text={item.text}>
+                  <div className="text-chat text-ink-soft">
+                    <AssistantMarkdown
+                      content={item.text}
+                      streaming={busy && index === items.length - 1}
+                    />
+                  </div>
+                </Turn>
               );
             case "thought":
               return (
-                <details key={index} className="chat-thought">
-                  <summary>thinking</summary>
-                  <div>{item.text}</div>
-                </details>
-              );
-            case "tool": {
-              const duration = item.startedAt === undefined ? null : elapsedLabel((item.finishedAt ?? clock) - item.startedAt);
-              return (
-                <details key={index} className={`chat-tool expandable ${item.status}`}>
-                  <summary>
-                    <span className="chat-tool-heading">
-                      <span className="chat-tool-title" title={item.title}>{item.title}</span>
-                      {item.input && item.input !== item.title && <code className="chat-tool-preview" title={item.input}>{item.input}</code>}
-                    </span>
-                    {duration && <span className="chat-tool-duration">{duration}</span>}
-                    <span className="chat-tool-status">{TOOL_STATUS_LABEL[item.status] ?? item.status}</span>
+                <details key={index} className="group">
+                  <summary className="mono-label chrome cursor-default list-none text-faint hover:text-muted">
+                    Thinking
                   </summary>
-                  <div className="chat-tool-detail">
-                    {item.input && <><span className="chat-tool-detail-label">Command / input</span><pre className="chat-tool-input">{item.input}</pre></>}
-                    {item.output ? <><span className="chat-tool-detail-label">Output</span><pre className="chat-tool-output">{item.output}</pre></>
-                      : <span className="chat-activity-detail">No output reported by the provider.</span>}
-                  </div>
+                  <div className="mt-1.5 text-[12.5px] leading-[18px] text-faint">{item.text}</div>
                 </details>
               );
-            }
             case "plan":
               return (
-                <ul key={index} className="chat-plan">
+                <ul key={index} className="flex flex-col gap-1">
                   {item.entries.map((entry, i) => (
-                    <li key={i} className={entry.status}>
+                    <li
+                      key={i}
+                      className={clsx(
+                        "text-[12.5px] leading-[18px]",
+                        PLAN_TONE[entry.status] ?? "text-muted",
+                      )}
+                    >
                       {entry.content}
                     </li>
                   ))}
                 </ul>
               );
+            case "step":
+              return <details key={item.step.id} className="fork-tool">
+                <summary><span>{item.tool ?? `${item.step.verb} ${item.step.object}`}</span><span>{item.step.status} · {elapsedLabel((item.step.elapsed_s ?? Math.max(0, (clock - Date.parse(item.step.started_at)) / 1000)) * 1000)}</span></summary>
+                {item.step.input !== undefined && <pre>{typeof item.step.input === "string" ? item.step.input : JSON.stringify(item.step.input, null, 2)}</pre>}
+                {item.step.output && <pre>{typeof item.step.output === "string" ? item.step.output : JSON.stringify(item.step.output, null, 2)}</pre>}
+              </details>;
             case "note":
               return (
-                <div key={index} className="chat-note">
+                <p key={index} className="text-chat text-muted">
                   {item.text}
-                </div>
+                </p>
               );
           }
         })}
-        {(busy || starting) && (
-          <div className={`chat-activity${activity.quiet ? " quiet" : ""}`} role="status" aria-live="polite">
-            <div className="chat-activity-main">
-              <span className="chat-activity-title">{activity.title}</span>
-              <span className="chat-activity-time">{elapsedLabel(clock - turnStartedAt)}</span>
-            </div>
-            <div className="chat-activity-detail">{activity.detail}</div>
-            {cancelledAt !== null && clock - cancelledAt >= 5000 && sessionRef.current && (
-              <button type="button" className="chat-activity-disconnect" onClick={disconnect}>Disconnect agent</button>
-            )}
-          </div>
-        )}
+        {(busy || starting) && <div className="fork-activity" role="status" aria-live="polite">
+          <div><strong>{work.title}</strong><span>{elapsedLabel(clock - turnStartedAt)}</span></div>
+          <p>{work.detail}</p>
+          {cancelling && work.quiet && <button type="button" onClick={() => void disconnect().catch((e) => setItems((list) => withNote(list, String(e))))}>Disconnect agent</button>}
+        </div>}
         {authNeeded !== "none" && (
-          <div className="chat-auth">
-            {label} isn't signed in on this Mac.{" "}
-            <button
-              className="chat-auth-button"
-              disabled={signingIn}
-              onClick={signIn}
-            >
+          <div className="flex flex-col items-start gap-2 rounded-[6px] bg-raised p-3">
+            <p className="text-chat text-muted">{label} isn't signed in on this Mac.</p>
+            <Button variant="accent" disabled={signingIn} onClick={signIn}>
               {signingIn ? "signing in…" : "sign in"}
-            </button>
+            </Button>
           </div>
         )}
-        {permissions.map((permission) => (
-          <div key={permission.id} className="chat-permission">
-            <div className="chat-permission-title">
-              {(() => {
-                // The permission event carries no tool kind, so only pattern
-                // matches translate; anything else reads as "use: <title>".
-                // The Rust fallback title is already a full sentence.
-                if (permission.title.startsWith(`${label} `)) return permission.title;
-                const asked = describe(permission.title, undefined, 1);
-                return asked === permission.title
-                  ? `${label} wants to use: ${permission.title}`
-                  : `${label} wants to ${asked}`;
-              })()}
-            </div>
-            <div className="chat-permission-options">
-              {permission.options.map((option) => (
-                <button
-                  key={option.optionId}
-                  className={`chat-permission-button ${option.kind}`}
-                  onClick={() => answerPermission(permission, option.optionId)}
-                >
-                  {option.name}
-                </button>
-              ))}
-            </div>
-          </div>
-        ))}
-      </div>
-      <form
-        className={dropping ? "chat-composer dropping" : "chat-composer"}
-        onSubmit={submit}
-      >
-        {attachments.length > 0 && (
-          <div className="chat-attachments">
-            {attachments.map((path) => (
-              <span key={path} className="chat-attachment">
-                <span className="chat-attachment-name">{basename(path)}</span>
-                <button
-                  type="button"
-                  className="chat-attachment-remove"
-                  aria-label={`remove ${basename(path)}`}
-                  disabled={configuring}
-                  onClick={() => attachmentDraft.remove(path)}
-                >
-                  ×
-                </button>
-              </span>
-            ))}
-          </div>
-        )}
-        <textarea
-          ref={inputRef}
-          defaultValue={draft?.text ?? ""}
-          className="chat-input"
-          placeholder={
-            busy
-              ? "Write your next message…"
-              : starting
-                ? restoringRef.current
-                  ? "Restoring conversation…"
-                  : `Starting ${label}…`
-                : `Describe or change ${isProject ? "the project" : part}…`
-          }
-          rows={2}
-          disabled={starting || configuring}
-          onChange={publishDraft}
-          onKeyDown={keydown}
-          onPaste={paste}
+        <ApprovalCard
+          questions={permissions.map((permission) => ({
+            id: permission.id,
+            title: askedFor(permission.title),
+            actions: permission.options.map((option) => ({
+              id: option.optionId,
+              label: option.name,
+              variant: permissionVariant(option.kind),
+            })),
+          }))}
+          onAnswer={(id, optionId) => {
+            const permission = permissions.find((p) => p.id === id);
+            if (permission) answerPermission(permission, optionId);
+          }}
         />
-        <div className="chat-composer-controls">
-          <button
-            type="button"
-            className="chat-attach"
-            title="attach photos or files"
-            aria-label="attach photos or files"
-            disabled={starting || configuring}
-            onClick={attach}
-          >
-            <IconPaperclip />
-          </button>
-          <ModelPicker
-            agent={agent}
-            config={config}
-            providers={agents.map((provider) => ({
-              ...provider,
-              config: provider.id === agent ? config : providerConfigs[provider.id] ?? [],
-              loading: providerLoading[provider.id] ?? false,
-              error: providerErrors[provider.id] ?? null,
-            }))}
-            disabled={configuring}
-            activeProviderBusy={busy || starting}
-            configuring={configuring}
-            error={configError}
-            hasConversation={items.length > 0 || Boolean(resume)}
-            onSelectModel={selectModel}
-            onSelectConfig={pick}
-            onRefresh={discoverModels}
-            onSignIn={async (id) => {
-              if (await onSignIn(id)) await discoverModels(id);
-            }}
-            onOpen={() => {
-              if (discoveryStartedRef.current || !providerIds) return;
-              discoveryStartedRef.current = true;
-              void discoverModels();
-            }}
-          />
-          <McpPanel path={path} sessionId={sessionRef.current} hidden={hidden} />
-          {busy || starting ? (
-            <button type="button" className="chat-send chat-stop" onClick={cancel} disabled={cancelledAt !== null}>
-              {cancelledAt !== null ? "stopping…" : "stop"}
-            </button>
-          ) : (
-            <button type="submit" className="chat-send" disabled={starting || configuring}>
-              send
-            </button>
-          )}
+        {/* The pill rides the end of the transcript, so a reply that lands while
+            the user is reading further up is an offer rather than a jump. */}
+        <div className="sticky bottom-2 z-10 h-0">
+          <NewItemsPill count={newReply ? 1 : 0} onClick={jumpToLatest} label={() => "New reply"} />
         </div>
-      </form>
-    </section>
+      </div>
+    </ChatPanel>
+    </div>
   );
 }
 
