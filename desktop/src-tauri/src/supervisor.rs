@@ -560,10 +560,11 @@ mod tests {
             dir.join("serve.py"),
             format!(
                 r#"
-import http.server, json, os, signal, sys
+import http.server, json, os, signal, socketserver, sys
 if {ignores_term}: signal.signal(signal.SIGTERM, signal.SIG_IGN)
 health = {{"ok": True, "pid": os.getpid()}}
-if {version} is not None: health["version"] = {version}
+version = {version}
+if version is not None: health["version"] = version
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         body = json.dumps(health).encode()
@@ -572,8 +573,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
     def log_message(self, *args): pass
-server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
-with open("port.tmp", "w") as f: f.write(str(server.server_port))
+# HTTPServer resolves its hostname during construction. These loopback fixtures
+# need no DNS, which can block startup on hosted macOS runners.
+server = socketserver.TCPServer(("127.0.0.1", 0), Handler)
+with open("port.tmp", "w") as f: f.write(str(server.server_address[1]))
 os.rename("port.tmp", "port")
 server.serve_forever()
 "#,
