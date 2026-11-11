@@ -9,6 +9,9 @@ use tauri::ipc::Channel;
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ChatEvent {
+    Activity {
+        phase: String,
+    },
     UserText {
         text: String,
     },
@@ -19,6 +22,12 @@ pub(crate) enum ChatEvent {
         text: String,
     },
     AgentText {
+        text: String,
+    },
+    /// A finished assistant message. The Claude driver streams deltas and then
+    /// repeats the whole block, so the webview swaps its streamed copy for
+    /// this one rather than appending it twice.
+    Prose {
         text: String,
     },
     AgentThought {
@@ -35,9 +44,13 @@ pub(crate) enum ChatEvent {
         input: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         output: Option<String>,
+        /// The files the call touched, for the folder fallback's capture.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        locations: Vec<String>,
     },
     ToolCallUpdate {
         id: String,
+        kind: Option<String>,
         title: Option<String>,
         status: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -45,6 +58,8 @@ pub(crate) enum ChatEvent {
         /// Replaces earlier output (ACP update fields replace, not append).
         #[serde(skip_serializing_if = "Option::is_none")]
         output: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        locations: Vec<String>,
     },
     Plan {
         entries: Vec<PlanItem>,
@@ -103,23 +118,40 @@ pub(super) fn forward(channel: &Channel<ChatEvent>, update: SessionUpdate, repla
         SessionUpdate::AgentThoughtChunk(chunk) => {
             text_of(chunk.content).map(|text| ChatEvent::AgentThought { text })
         }
-        SessionUpdate::ToolCall(call) => Some(ChatEvent::ToolCall {
-            id: wire_string(&call.tool_call_id),
-            title: call.title,
-            kind: wire_string(&call.kind),
-            status: wire_string(&call.status),
-            input: input_of(call.raw_input.as_ref()),
-            output: output_of(&call.content, call.raw_output.as_ref()),
-        }),
+        SessionUpdate::ToolCall(call) => {
+            // An MCP tool arrives under whatever spelling the adapter gives
+            // it; the card only renders a nurb verb once it is named as one.
+            let (title, kind) = super::mcp::named(call.title, wire_string(&call.kind));
+            // A replayed nurb call already has its row in the transcript, so
+            // forwarding it would show the step twice.
+            if replaying && kind == super::mcp::SERVER {
+                return;
+            }
+            Some(ChatEvent::ToolCall {
+                id: wire_string(&call.tool_call_id),
+                title,
+                kind,
+                status: wire_string(&call.status),
+                input: input_of(call.raw_input.as_ref()).or_else(|| locations_of(&call.locations)),
+                output: output_of(&call.content, call.raw_output.as_ref()),
+                locations: paths_of(Some(&call.locations)),
+            })
+        }
         SessionUpdate::ToolCallUpdate(update) => Some(ChatEvent::ToolCallUpdate {
             id: wire_string(&update.tool_call_id),
-            title: update.fields.title,
+            kind: update.fields.kind.as_ref().map(wire_string),
+            title: update
+                .fields
+                .title
+                .map(|title| super::mcp::named(title, String::new()).0),
             status: update.fields.status.as_ref().map(wire_string),
-            input: input_of(update.fields.raw_input.as_ref()),
+            input: input_of(update.fields.raw_input.as_ref())
+                .or_else(|| locations_of(update.fields.locations.as_deref().unwrap_or(&[]))),
             output: output_of(
                 update.fields.content.as_deref().unwrap_or(&[]),
                 update.fields.raw_output.as_ref(),
             ),
+            locations: paths_of(update.fields.locations.as_deref()),
         }),
         SessionUpdate::Plan(plan) => Some(ChatEvent::Plan {
             entries: plan
@@ -159,6 +191,17 @@ pub(crate) fn mirror(event: &ChatEvent) {
     let _ = event;
 }
 
+/// The files a tool call named, which the folder fallback captures back.
+fn paths_of(
+    locations: Option<&[agent_client_protocol::schema::v1::ToolCallLocation]>,
+) -> Vec<String> {
+    locations
+        .unwrap_or_default()
+        .iter()
+        .map(|location| location.path.display().to_string())
+        .collect()
+}
+
 fn text_of(content: ContentBlock) -> Option<String> {
     match content {
         ContentBlock::Text(text) => Some(text.text),
@@ -170,7 +213,7 @@ fn text_of(content: ContentBlock) -> Option<String> {
 /// build output to make the point.
 const DETAIL_CAP: usize = 20_000;
 
-fn capped(mut text: String) -> Option<String> {
+pub(crate) fn capped(mut text: String) -> Option<String> {
     if text.trim().is_empty() {
         return None;
     }
@@ -189,12 +232,36 @@ fn capped(mut text: String) -> Option<String> {
 /// for terminal calls (both adapters' shapes), else the file the well-known
 /// path keys name. The full raw input can carry an entire file's content, so
 /// anything else stays out.
+fn locations_of(
+    locations: &[agent_client_protocol::schema::v1::ToolCallLocation],
+) -> Option<String> {
+    capped(
+        locations
+            .iter()
+            .map(|location| match location.line {
+                Some(line) => format!("{}:{line}", location.path.display()),
+                None => location.path.display().to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
 fn input_of(raw: Option<&serde_json::Value>) -> Option<String> {
     if let Some(command) = super::policy::command_of(raw) {
         return capped(command);
     }
     let raw = raw?;
-    for key in ["file_path", "path", "abs_path", "notebook_path", "pattern", "url"] {
+    for key in [
+        "file_path",
+        "path",
+        "abs_path",
+        "notebook_path",
+        "pattern",
+        "url",
+        "description",
+        "query",
+    ] {
         if let Some(value) = raw.get(key).and_then(|v| v.as_str()) {
             return capped(value.to_string());
         }
@@ -203,8 +270,7 @@ fn input_of(raw: Option<&serde_json::Value>) -> Option<String> {
 }
 
 /// What a tool call produced: its text content blocks, else the string-ish
-/// parts of raw output. Diffs and terminal embeds stay out; the app's promise
-/// is plain language first, and errors arrive as text.
+/// parts of raw output. File edits include the reported before/after contents.
 fn output_of(
     content: &[agent_client_protocol::schema::v1::ToolCallContent],
     raw: Option<&serde_json::Value>,
@@ -214,6 +280,12 @@ fn output_of(
         .iter()
         .filter_map(|item| match item {
             ToolCallContent::Content(block) => text_of(block.content.clone()),
+            ToolCallContent::Diff(diff) => Some(format!(
+                "File: {}\nBefore:\n{}\nAfter:\n{}",
+                diff.path.display(),
+                diff.old_text.as_deref().unwrap_or("(new file)"),
+                diff.new_text
+            )),
             _ => None,
         })
         .collect();
@@ -273,7 +345,7 @@ pub(super) fn wire_string<T: Serialize>(value: &T) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{input_of, output_of, replayed_user_text};
+    use super::{input_of, locations_of, output_of, replayed_user_text};
     use agent_client_protocol::schema::v1::ToolCallContent;
 
     #[test]
@@ -285,19 +357,41 @@ mod tests {
         assert_eq!(input_of(Some(&edit)).as_deref(), Some("/p/parts/lid.py"));
         assert_eq!(input_of(None), None);
 
-        // Text content blocks win; diffs and terminal embeds stay out.
+        // Text and file edits are both visible in expanded tool details.
         let content: Vec<ToolCallContent> = serde_json::from_value(serde_json::json!([
             { "type": "content", "content": { "type": "text", "text": "3 findings" } },
             { "type": "diff", "path": "/p/parts/lid.py", "newText": "code" }
         ]))
         .unwrap();
-        assert_eq!(output_of(&content, None).as_deref(), Some("3 findings"));
+        let output = output_of(&content, None).unwrap();
+        assert!(output.starts_with("3 findings"));
+        assert!(output.contains("File: /p/parts/lid.py\nBefore:\n(new file)\nAfter:\ncode"));
 
         // With no blocks, the string-ish parts of raw output.
         let raw = serde_json::json!({ "stdout": "built in 2.1s", "exitCode": 0 });
         assert_eq!(output_of(&[], Some(&raw)).as_deref(), Some("built in 2.1s"));
-        assert_eq!(output_of(&[], Some(&serde_json::json!({ "exitCode": 0 }))), None);
+        assert_eq!(
+            output_of(&[], Some(&serde_json::json!({ "exitCode": 0 }))),
+            None
+        );
         assert_eq!(output_of(&[], None), None);
+    }
+
+    #[test]
+    fn tool_locations_and_subagent_descriptions_are_visible() {
+        use agent_client_protocol::schema::v1::ToolCallLocation;
+        let location = ToolCallLocation::new("/project/parts/lid.py").line(12);
+        assert_eq!(
+            locations_of(&[location]).as_deref(),
+            Some("/project/parts/lid.py:12")
+        );
+        assert_eq!(
+            input_of(Some(
+                &serde_json::json!({ "description": "Inspect geometry" })
+            ))
+            .as_deref(),
+            Some("Inspect geometry")
+        );
     }
 
     #[test]

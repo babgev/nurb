@@ -1,4 +1,4 @@
-const REPORT_URL = "https://github.com/Shpigford/nurb/issues/new";
+const REPORT_URL = "https://github.com/babgev/nurb/issues/new";
 const TRUNCATED = "\n\n[error truncated]";
 
 export const REPORT_URL_MAX_LENGTH = 6_000;

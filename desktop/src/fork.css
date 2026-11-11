@@ -1,0 +1,13 @@
+/* Fork controls share the upstream palette and typography. */
+:root {
+  --bg: var(--color-ground); --panel: var(--color-ground); --panel2: var(--color-raised); --bad: var(--color-fail); --text: var(--color-ink);
+  --dim: var(--color-muted); --dimmer: var(--color-faint); --line: var(--color-line); --hover: var(--color-raised);
+  --active: var(--color-raised); --accent: var(--color-accent); --sans: var(--font-sans); --mono: var(--font-mono);
+}
+.mcp-panel { box-shadow: var(--shadow-panel); }
+.mcp-error { background: var(--color-fail-wash); color: var(--color-fail); }
+.mcp-state-mark.error { color: var(--color-fail); }
+
+.legacy-history { margin: auto; width: min(840px, calc(100vw - 48px)); height: min(780px, calc(100vh - 48px)); padding: 0; background: var(--color-ground); border: 1px solid var(--color-line); border-radius: 12px; box-shadow: var(--shadow-panel); }
+.legacy-history[open] { display: flex; flex-direction: column; }
+.legacy-history::backdrop { background: rgb(0 0 0 / 25%); }

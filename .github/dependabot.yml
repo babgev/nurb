@@ -1,0 +1,11 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /desktop/adapter-runtime
+    schedule:
+      interval: weekly
+    versioning-strategy: increase
+    groups:
+      agent-runtimes:
+        patterns:
+          - "*"

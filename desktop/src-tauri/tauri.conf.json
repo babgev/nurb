@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "nurb",
-  "version": "0.26.0",
-  "identifier": "dev.nurb.desktop",
+  "productName": "Nurb Fork",
+  "version": "1.2.1",
+  "identifier": "io.github.babgev.nurb",
   "build": {
     "beforeDevCommand": "npm run stage && npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,41 +12,54 @@
   "app": {
     "windows": [
       {
-        "title": "nurb",
+        "title": "Nurb Fork",
         "titleBarStyle": "Overlay",
-        "theme": "Dark",
+        "theme": "Light",
         "hiddenTitle": true,
-        "trafficLightPosition": { "x": 18, "y": 22 },
-        "backgroundColor": "#16181d",
-        "width": 1360,
-        "height": 860,
-        "minWidth": 900,
-        "minHeight": 600
+        "trafficLightPosition": {
+          "x": 33,
+          "y": 44
+        },
+        "backgroundColor": "#e5f0fb",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 1200,
+        "minHeight": 640
       }
     ],
     "security": {
       "csp": {
         "default-src": "'self'",
         "style-src": "'self' 'unsafe-inline'",
-        "connect-src": "ipc: http://ipc.localhost",
-        "frame-src": "'self' http://127.0.0.1:* http://localhost:*"
+        "connect-src": "'self' ipc: http://ipc.localhost http://127.0.0.1:* ws://127.0.0.1:*",
+        "img-src": "'self' data: blob: http://127.0.0.1:*",
+        "font-src": "'self' data:",
+        "worker-src": "'self' blob:"
+      },
+      "devCsp": {
+        "default-src": "'self'",
+        "style-src": "'self' 'unsafe-inline'",
+        "connect-src": "'self' ipc: http://ipc.localhost http://127.0.0.1:* ws://127.0.0.1:*",
+        "img-src": "'self' data: blob: http://127.0.0.1:*",
+        "font-src": "'self' data:",
+        "worker-src": "'self' blob:"
       }
     }
   },
-  "plugins": {
-    "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQyOTYyNkI5RTg3NkFFRDQKUldUVXJuYm91U2FXUWdNWGQvT1VwY2FQb3lhclFzWDZTRzhRa3k3NXRJaThJbVEzbWNmOVowbEQK",
-      "endpoints": [
-        "https://github.com/Shpigford/nurb/releases/download/desktop-latest/latest.json"
-      ]
-    }
-  },
+  "plugins": {},
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg"],
-    "createUpdaterArtifacts": true,
-    "externalBin": ["binaries/uv"],
-    "resources": ["resources/*"],
+    "targets": [
+      "app",
+      "dmg"
+    ],
+    "createUpdaterArtifacts": false,
+    "externalBin": [
+      "binaries/uv"
+    ],
+    "resources": [
+      "resources/*"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
